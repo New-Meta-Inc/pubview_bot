@@ -9,6 +9,7 @@ import time
 # --- 設定項目 ---
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 RIOT_API_KEY = os.getenv('RIOT_API_KEY')
+DISCORD_GUILD_ID = int(os.getenv('DISCORD_GUILD_ID'))
 DB_PATH = '/data/lol_bot.db'
 NOTIFICATION_CHANNEL_ID = 1401719055643312219 # 通知用チャンネルID
 RANK_ROLES = {
@@ -160,7 +161,7 @@ async def on_ready() -> None:
     check_ranks_periodically.start()
 
 # --- コマンド ---
-@bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。")
+@bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。", guild_ids=[DISCORD_GUILD_ID])
 async def register(ctx: discord.ApplicationContext, game_name: str, tag_line: str) -> None:
     await ctx.defer()
     if tag_line.startswith("#"):
@@ -191,7 +192,7 @@ async def register(ctx: discord.ApplicationContext, game_name: str, tag_line: st
         print(f"!!! An unexpected error occurred in 'register' command: {e}")
         await ctx.respond("登録中に予期せぬエラーが発生しました。")
 
-@bot.slash_command(name="register_by_other", description="指定したユーザーのRiot IDをボットに登録します。（管理者向け）")
+@bot.slash_command(name="register_by_other", description="指定したユーザーのRiot IDをボットに登録します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def register_by_other(ctx: discord.ApplicationContext, user: discord.Member, game_name: str, tag_line: str) -> None:
     await ctx.defer(ephemeral=True) # コマンド結果は実行者のみに見える
@@ -224,7 +225,7 @@ async def register_by_other(ctx: discord.ApplicationContext, user: discord.Membe
         print(f"!!! An unexpected error occurred in 'register_by_other' command: {e}")
         await ctx.respond("登録中に予期せぬエラーが発生しました。")
 
-@bot.slash_command(name="unregister", description="ボットからあなたの登録情報を削除します。")
+@bot.slash_command(name="unregister", description="ボットからあなたの登録情報を削除します。", guild_ids=[DISCORD_GUILD_ID])
 async def unregister(ctx: discord.ApplicationContext) -> None:
     await ctx.defer()
     try:
@@ -247,7 +248,7 @@ async def unregister(ctx: discord.ApplicationContext) -> None:
     except Exception as e:
         await ctx.respond("登録解除中に予期せぬエラーが発生しました。")
 
-@bot.slash_command(name="ranking", description="サーバー内のLoLランクランキングを表示します。")
+@bot.slash_command(name="ranking", description="サーバー内のLoLランクランキングを表示します。", guild_ids=[DISCORD_GUILD_ID])
 async def ranking(ctx: discord.ApplicationContext) -> None:
     await ctx.defer()
     try:
@@ -261,7 +262,7 @@ async def ranking(ctx: discord.ApplicationContext) -> None:
         await ctx.respond("ランキングの作成中にエラーが発生しました。")
 
 # --- デバッグ用コマンド ---
-@bot.slash_command(name="debug_check_ranks_periodically", description="定期的なランクチェックを手動で実行します。（デバッグ用）")
+@bot.slash_command(name="debug_check_ranks_periodically", description="定期的なランクチェックを手動で実行します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def debug_check_ranks_periodically(ctx: discord.ApplicationContext) -> None:
     await ctx.defer(ephemeral=True)
@@ -272,7 +273,7 @@ async def debug_check_ranks_periodically(ctx: discord.ApplicationContext) -> Non
     except Exception as e:
         await ctx.followup.send(f"処理中にエラーが発生しました: {e}")
 
-@bot.slash_command(name="debug_rank_all_iron", description="登録者全員のランクをIron IVに設定します。（デバッグ用）")
+@bot.slash_command(name="debug_rank_all_iron", description="登録者全員のランクをIron IVに設定します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def debug_rank_all_iron(ctx: discord.ApplicationContext) -> None:
     await ctx.defer(ephemeral=True)
@@ -288,7 +289,7 @@ async def debug_rank_all_iron(ctx: discord.ApplicationContext) -> None:
     except Exception as e:
         await ctx.respond(f"処理中にエラーが発生しました: {e}")
 
-@bot.slash_command(name="debug_modify_rank", description="特定のユーザーのランクを強制的に変更します。（デバッグ用）")
+@bot.slash_command(name="debug_modify_rank", description="特定のユーザーのランクを強制的に変更します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def debug_modify_rank(ctx: discord.ApplicationContext, user: discord.Member, tier: str, rank: str, league_points: int) -> None:
     await ctx.defer(ephemeral=True)
