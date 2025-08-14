@@ -11,7 +11,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 RIOT_API_KEY = os.getenv('RIOT_API_KEY')
 DISCORD_GUILD_ID = int(os.getenv('DISCORD_GUILD_ID'))
 DB_PATH = '/data/lol_bot.db'
-NOTIFICATION_CHANNEL_ID = 1401719055643312219 # 通知用チャンネルID
+NOTIFICATION_CHANNEL_ID = 1402091279700983819 # 通知用チャンネルID
 RANK_ROLES = {
     "IRON": "LoL Iron(Solo/Duo)", "BRONZE": "LoL Bronze(Solo/Duo)", "SILVER": "LoL Silver(Solo/Duo)",
     "GOLD": "LoL Gold(Solo/Duo)", "PLATINUM": "LoL Platinum(Solo/Duo)", "EMERALD": "LoL Emerald(Solo/Duo)",
@@ -51,6 +51,81 @@ lol_watcher = LolWatcher(RIOT_API_KEY)
 my_region_for_account = 'asia'
 my_region_for_summoner = 'jp1'
 # -----------------------------
+
+# --- UIコンポーネント (View) ---
+class DashboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Riot IDの登録", style=discord.ButtonStyle.success, custom_id="dashboard:register")
+    async def register_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.send_modal(RegisterModal())
+
+    @discord.ui.button(label="Riot IDの登録解除", style=discord.ButtonStyle.danger, custom_id="dashboard:unregister")
+    async def unregister_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("DELETE FROM users WHERE discord_id = ?", (interaction.user.id,))
+            con.commit()
+
+            if con.total_changes > 0:
+                await interaction.followup.send("あなたの登録情報を削除しました。", ephemeral=True, delete_after=30.0)
+                # ランク連動ロール削除処理
+                guild = interaction.guild
+                member = await guild.fetch_member(interaction.user.id)
+                if member:
+                    role_names_to_remove = [discord.utils.get(guild.roles, name=role_name) for role_name in RANK_ROLES.values()]
+                    await member.remove_roles(*[role for role in role_names_to_remove if role is not None and role in member.roles])
+            else:
+                await interaction.followup.send("あなたはまだ登録されていません。", ephemeral=True, delete_after=30.0)
+            
+            con.close()
+        except Exception as e:
+            print(f"!!! An unexpected error occurred in 'unregister_button': {e}")
+            await interaction.followup.send("登録解除中に予期せぬエラーが発生しました。", ephemeral=True, delete_after=30.0)
+
+
+class RegisterModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Riot ID 登録")
+        self.add_item(discord.ui.InputText(label="Riot ID (例: TaroYamada)", required=True))
+        self.add_item(discord.ui.InputText(label="Tagline (例: JP1) ※#は不要", required=True))
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        game_name = self.children[0].value
+        tag_line = self.children[1].value
+
+        if tag_line.startswith("#"):
+            tag_line = tag_line[1:]
+        tag_line = tag_line.upper()
+
+        try:
+            account_info = riot_watcher.account.by_riot_id(my_region_for_account, game_name, tag_line)
+            puuid = account_info['puuid']
+            rank_info = get_rank_by_puuid(puuid)
+
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            if rank_info:
+                cur.execute("INSERT OR REPLACE INTO users (discord_id, riot_puuid, game_name, tag_line, tier, rank, league_points) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (interaction.user.id, puuid, game_name, tag_line, rank_info['tier'], rank_info['rank'], rank_info['leaguePoints']))
+            else:
+                cur.execute("INSERT OR REPLACE INTO users (discord_id, riot_puuid, game_name, tag_line, tier, rank, league_points) VALUES (?, ?, ?, ?, NULL, NULL, NULL)",
+                            (interaction.user.id, puuid, game_name, tag_line))
+            con.commit()
+            con.close()
+            await interaction.followup.send(f"Riot ID「{game_name}#{tag_line}」を登録しました！", ephemeral=True, delete_after=30.0)
+        except ApiError as err:
+            if err.response.status_code == 404:
+                await interaction.followup.send(f"Riot ID「{game_name}#{tag_line}」が見つかりませんでした。", ephemeral=True, delete_after=30.0)
+            else:
+                await interaction.followup.send("Riot APIでエラーが発生しました。", ephemeral=True, delete_after=30.0)
+        except Exception as e:
+            print(f"!!! An unexpected error occurred in 'RegisterModal' callback: {e}")
+            await interaction.followup.send("登録中に予期せぬエラーが発生しました。", ephemeral=True, delete_after=30.0)
 
 # --- ヘルパー関数 ---
 def get_rank_by_puuid(puuid: str) -> dict | None:
@@ -150,6 +225,8 @@ async def create_ranking_embed() -> discord.Embed:
 async def on_ready() -> None:
     print(f"Bot logged in as {bot.user}")
 
+    # Bot起動時に永続Viewを登録
+    bot.add_view(DashboardView())
     # ▼▼▼ 起動時にランキングを投稿する処理を追加 ▼▼▼
     print("--- Posting initial ranking on startup ---")
     channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
@@ -260,6 +337,30 @@ async def ranking(ctx: discord.ApplicationContext) -> None:
     except Exception as e:
         print(f"!!! An unexpected error occurred in 'ranking' command: {e}")
         await ctx.respond("ランキングの作成中にエラーが発生しました。")
+
+# --- 管理者向けコマンド ---
+@bot.slash_command(name="dashboard", description="登録・登録解除用のダッシュボードを送信します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def dashboard(ctx: discord.ApplicationContext, channel: discord.TextChannel = None):
+    """
+    ダッシュボードメッセージを送信します。
+    """
+    target_channel = channel or ctx.channel
+    embed = discord.Embed(
+        title="# ダッシュボード", # 絵文字は適当なものに置き換えてください
+        description=(
+            "## Riot IDの登録\n"
+            "あなたのRiot IDをサーバーに登録しましょう！\n"
+            f"このボタンからあなたのRiot IDを登録すると、あなたのSolo/Duoランクが24時間ごとに自動でチェックされ、サーバー内のラダーランキング(<#{NOTIFICATION_CHANNEL_ID}>)に反映されます。\n"
+            "## Riot IDの登録解除\n"
+            "ボットからあなたのRiot ID情報を削除します。\n"
+        ),
+        color=discord.Color.blue()
+    )
+
+    await target_channel.send(embed=embed, view=DashboardView())
+    await ctx.respond("ダッシュボードを送信しました。", ephemeral=True)
+
 
 # --- デバッグ用コマンド ---
 @bot.slash_command(name="debug_check_ranks_periodically", description="定期的なランクチェックを手動で実行します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
