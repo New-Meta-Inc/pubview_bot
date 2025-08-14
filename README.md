@@ -1,113 +1,98 @@
----
-## ぱぶびゅ！Discord の目的
+# ぱぶびゅ！ LoL Rank Bot
 
-ぱぶびゅ！におけるDiscordの目的は以下
-* メンバーのLoL愛を深めること
-* メンバー同士が仲良くなること
-* ぱぶびゅ！を好きになってもらうこと
+## 概要
 
-ぱぶびゅ！botはこれらの目的達成を支援するコミュニティマネジメントのシステム
+このDiscordボットは、サーバーに参加しているメンバーのLeague of Legends (LoL) のSolo/Duoランク情報を自動で管理し、コミュニティ活動を活性化させるためのツールです。主な機能として、ランクに基づいたランキングの自動生成、ランクに応じたDiscordロールの自動付与、そしてランクアップ時のお祝い通知などがあります。
+
+ユーザーはダッシュボード上のボタンから直感的に自身のRiot IDを登録・解除でき、管理者は簡単なコマンドでボットの管理やデバッグが可能です。
 
 ---
+
 ## コンポーネント間の連携
 
 ### 1. ユーザー
-
-PCやスマートフォンでDiscordアプリを使用し、ボットにコマンドを送信します。
-
--   **アクション**: `/register`, `/ranking` などのスラッシュコマンドを入力。
--   **通信先**: Discordサーバー
+PCやスマートフォンのDiscordアプリを使用し、ボットにコマンドを送信したり、ボタンを操作します。
+- **アクション**: `/ranking` などのスラッシュコマンド入力、ダッシュボードのボタン操作。
+- **通信先**: Discordサーバー
 
 ### 2. Discordサーバー
+ユーザーからの操作を受け取り、ボット（バックエンドアプリケーション）にイベントとして転送します。
+- **アクション**:
+    -   ユーザーからのコマンドやボタン操作を受け付けます。
+    -   その内容をボットにイベントとして通知します。
+    -   ボットからのレスポンス（ランキングの埋め込みメッセージなど）をユーザーに表示します。
+-   **通信先**: ユーザー、およびボットアプリケーション。
 
-Discordのバックエンドシステム。ユーザーからのコマンドを受け取り、ボットにイベントとして転送します。
-
+### 3. ボットアプリケーション (このリポジトリ)
+Dockerコンテナとして動作し、Discordからのイベントを処理します。
 -   **アクション**:
-    -   ユーザーからのコマンドを受け付けます。
-    -   コマンドの内容をボットにイベントとして通知します。
-    -   ボットからのレスポンスをユーザーに表示します。
--   **通信先**: ユーザー、および **Kubernetes** 上で動作するボット
-
-### 3. Kubernetes
-
-ボットアプリケーションを管理・実行するためのプラットフォーム。コンテナ化されたボットを安定して稼働させます。
-
--   **備考**:
-    -   k8s上のDiscord botは、起動時にDiscordバックエンドとのTCPコネクションを確立し、以降そのコネクションを利用し続ける為、k8sのエンドポイントがグローバルに公開されている必要はない
--   **アクション**:
-    -   **Discordサーバー**からイベントを受け取り、ボットアプリケーションへ渡します。
-    -   ボットは **Riot Games API** にアクセスしてデータを取得し、**Discordサーバー**にレスポンスを返します。
--   **通信先**: Discordサーバー、および Riot Games API
-
+    -   Discordサーバーからイベントを受け取ります。
+    -   必要に応じて **Riot Games API** にアクセスし、プレイヤーのランク情報を取得します。
+    -   取得したデータやコマンドの実行結果を **Discordサーバー** にレスポンスとして返します。
+-   **通信先**: Discordサーバー、Riot Games API
 
 ---
+
 ## 動作方法
 
-### 0. k8s clusterの準備
+### 1. 必要なAPIキーとIDの取得
 
-このbotは、k8s上で動かすことを想定しています。
+ボットを動作させるには、以下の情報が必要です。
+- **Discord Bot Token**: [Discord Developer Portal](https://discord.com/developers/applications)でアプリケーションを作成し、Botトークンを取得します。
+- **Riot Games API Key**: [Riot Games Developer Portal](https://developer.riotgames.com/)からAPIキーを取得します。
+- **Discord Guild ID**: ボットを導入するDiscordサーバーのID。
+- **Notification Channel ID**: ランキングや通知を投稿するテキストチャンネルのID。
 
-```
-%kubectl version
-Client Version: v1.32.2
-Kustomize Version: v5.5.0
-Server Version: v1.32.2
-```
+### 2. 環境変数ファイルの準備
 
-### 1. 必要なAPIキーの取得
+プロジェクトのルートディレクトリに `.env` ファイルを作成し、取得した情報を記述します。
 
-このボットを動作させるには、以下の2つのAPIキーが必要です。
-適当なDiscordサーバーを建て、手元で動作検証してください。
-
-* **Riot API Key**
-* **Discord Bot Token**
-
-### 2. 環境変数の設定
-
-取得したAPIキーとトークンを設定する。
-
-```
-kubectl create secret generic bot-secrets --from-literal=DISCORD_TOKEN='{Discord Bot Token}' --from-literal=RIOT_API_KEY='{Riot API Key}'
+```env
+DISCORD_TOKEN="YOUR_DISCORD_TOKEN"
+RIOT_API_KEY="YOUR_RIOT_API_KEY"
+DISCORD_GUILD_ID="YOUR_GUILD_ID"
+NOTIFICATION_CHANNEL_ID="YOUR_CHANNEL_ID"
 ```
 
-### 3. ボットの実行
+### 3. Dockerでの実行
 
+Dockerがインストールされている環境で、以下のコマンドを実行します。
 
+```bash
+# 1. Dockerイメージのビルド
+docker build -t lol-rank-bot:latest .
+
+# 2. Dockerコンテナの実行
+docker run --env-file .env --name lol-bot -d lol-rank-bot:latest
 ```
-%docker build -t lol-rank-bot:latest .
-
-%kubectl apply -f deployment.yaml
-```
+これにより、ボットがバックグラウンドで起動します。
 
 ---
 
 ## 使い方
 
-ボットはスラッシュコマンド（`/`）で操作します。
+### プレイヤー情報の登録と削除 (ダッシュボードからの操作)
 
-### プレイヤー情報の登録と削除
+管理者によって設置されたダッシュボードのボタンから直感的に操作できます。
 
-#### `/register [game_name] [tag_line]`
+- **Riot IDの登録**: ボタンを押すと表示されるウィンドウに、あなたのRiot IDとTaglineを入力して登録します。
+- **Riot IDの登録解除**: ボタンを押すと、あなたの情報がボットから削除されます。
 
-あなたのRiot IDをボットに登録します。これにより、定期的なランクチェックやランキングの対象となります。
+※操作後の確認メッセージは30秒で自動的に消えます。
 
-**例**: `/register ぱぶびゅー JP1`
+### スラッシュコマンド一覧
 
-#### `/unregister`
+#### 一般ユーザー向けコマンド
+-   `/register [game_name] [tag_line]`: Riot IDをボットに登録します。
+-   `/unregister`: 登録情報を削除します。
+-   `/ranking`: サーバー内のランクランキングを表示します。
 
-ボットに登録したあなたの情報を削除します。
-
-### ランクの確認とランキング表示
-
-#### `/check [game_name] [tag_line]`
-
-指定したRiot IDの現在のSolo/Duoランクをリアルタイムで確認します。登録していないユーザーのランクも調べられます。
-
-**例**: `/check T1 Faker #KR1`
-
-#### `/ranking`
-
-サーバーに登録されている全ユーザーのSolo/Duoランクをランキング形式で表示します。
+#### 管理者向けコマンド
+-   `/dashboard [channel]`: 登録・登録解除用のダッシュボードを指定チャンネルに送信します。
+-   `/register_by_other [user] [game_name] [tag_line]`: 他のユーザーに代わってRiot IDを登録します。
+-   `/debug_check_ranks_periodically`: 定期ランクチェックを手動で実行します。
+-   `/debug_rank_all_iron`: 登録者全員のランクをIron IVに設定します。
+-   `/debug_modify_rank [user] [tier] [rank] [league_points]`: 特定ユーザーのランクを強制的に変更します。
 
 ---
 
