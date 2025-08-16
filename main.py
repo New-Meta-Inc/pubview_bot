@@ -487,6 +487,9 @@ async def check_ranks_periodically() -> None:
             print(f"Error processing user {discord_id}: {e}")
             continue
 
+    con.commit()
+    con.close()
+
     # --- 定期ランキング速報処理 ---
     if channel:
         ranking_embed = await create_ranking_embed()
@@ -500,9 +503,6 @@ async def check_ranks_periodically() -> None:
         if new_value > old_value:
             riot_id_full = f"{game_name}#{tag_line.upper()}"
             await channel.send(f"🎉 **ランクアップ！** 🎉\nおめでとうございます、{member.mention}さん ({riot_id_full})！\n**{old_tier} {old_rank}** → **{new_rank_info['tier']} {new_rank_info['rank']}** に昇格しました！")
-
-    con.commit()
-    con.close()
 
     print("--- Periodic rank check finished ---")
 
