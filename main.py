@@ -36,6 +36,13 @@ def setup_database() -> None:
             league_points INTEGER
         )
     ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS sections (
+            role_id INTEGER PRIMARY KEY,
+            section_name TEXT NOT NULL UNIQUE,
+            notification_channel_id INTEGER NOT NULL
+        )
+    ''')
     con.commit()
     con.close()
 # -----------------------------
@@ -80,11 +87,54 @@ class DashboardView(discord.ui.View):
                     await member.remove_roles(*[role for role in role_names_to_remove if role is not None and role in member.roles])
             else:
                 await interaction.followup.send("あなたはまだ登録されていません。", ephemeral=True, delete_after=30.0)
-            
+
             con.close()
         except Exception as e:
             print(f"!!! An unexpected error occurred in 'unregister_button': {e}")
             await interaction.followup.send("登録解除中に予期せぬエラーが発生しました。", ephemeral=True, delete_after=30.0)
+
+    @discord.ui.button(label="セクションに参加", style=discord.ButtonStyle.primary, custom_id="dashboard:join_section")
+    async def get_section_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        guild = interaction.guild
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT role_id, section_name FROM sections")
+        all_sections = cur.fetchall()
+        con.close()
+
+        available_sections = []
+        for role_id, section_name in all_sections:
+            role = guild.get_role(role_id)
+            if role and len(role.members) < 50:
+                available_sections.append((role_id, section_name))
+        
+        if not available_sections:
+            await interaction.response.send_message("現在参加可能なセクションはありません。", ephemeral=True, delete_after=60)
+            return
+
+        await interaction.response.send_message(content="参加したいセクションを選択してください。", view=SectionSelectView(available_sections), ephemeral=True, delete_after=180)
+
+    @discord.ui.button(label="セクションから退出", style=discord.ButtonStyle.secondary, custom_id="dashboard:leave_section", disabled=False)
+    async def remove_section_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        member = interaction.user
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT role_id FROM sections")
+        managed_role_ids = {row[0] for row in cur.fetchall()}
+        con.close()
+
+        user_managed_roles = [role for role in member.roles if role.id in managed_role_ids]
+
+        if not user_managed_roles:
+            await interaction.response.send_message("退出可能なセクションがありません。", ephemeral=True, delete_after=60)
+            return
+
+        await interaction.response.send_message(
+            content="退出したいセクションを選択してください。",
+            view=RemoveSectionView(user_managed_roles),
+            ephemeral=True,
+            delete_after=180
+        )
 
 
 class RegisterModal(discord.ui.Modal):
@@ -126,6 +176,88 @@ class RegisterModal(discord.ui.Modal):
         except Exception as e:
             print(f"!!! An unexpected error occurred in 'RegisterModal' callback: {e}")
             await interaction.followup.send("登録中に予期せぬエラーが発生しました。", ephemeral=True, delete_after=30.0)
+
+
+class SectionSelectView(discord.ui.View):
+    def __init__(self, available_sections: list):
+        super().__init__(timeout=180)
+        self.add_item(SectionSelect(available_sections))
+
+class SectionSelect(discord.ui.Select):
+    def __init__(self, available_sections: list):
+        options = [
+            discord.SelectOption(label=section_name, value=str(role_id)) for role_id, section_name in available_sections
+        ]
+        if not options:
+            options.append(discord.SelectOption(label="参加可能なセクションがありません", value="no_sections", default=True))
+        
+        super().__init__(placeholder="参加したいセクションを選択してください", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "no_sections":
+            await interaction.response.edit_message(content="現在参加できるセクションはありません。", view=None)
+            return
+
+        role_id = int(self.values[0])
+        guild = interaction.guild
+        section_role = guild.get_role(role_id)
+
+        if not section_role:
+            await interaction.response.edit_message(content="指定されたセクション（ロール）が見つかりませんでした。", view=None)
+            return
+
+        member = await guild.fetch_member(interaction.user.id)
+        if section_role in member.roles:
+            await interaction.response.edit_message(content=f"あなたは既にセクション「{section_role.name}」に参加しています。", view=None)
+            return
+
+        try:
+            await member.add_roles(section_role)
+
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cur.execute("SELECT notification_channel_id FROM sections WHERE role_id = ?", (role_id,))
+            result = cur.fetchone()
+            con.close()
+
+            if result:
+                channel_id = result[0]
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(f"{member.mention}さんがセクション「{section_role.name}」に参加しました！")
+            
+            await interaction.response.edit_message(content=f"セクション「{section_role.name}」に参加しました！", view=None)
+        except Exception as e:
+            print(f"!!! An unexpected error occurred in 'SectionSelect' callback: {e}")
+            await interaction.response.edit_message(content="セクションへの参加中にエラーが発生しました。", view=None)
+
+class RemoveSectionView(discord.ui.View):
+    def __init__(self, user_roles: list[discord.Role]):
+        super().__init__(timeout=180)
+        self.add_item(RemoveSectionSelect(user_roles))
+
+class RemoveSectionSelect(discord.ui.Select):
+    def __init__(self, user_roles: list[discord.Role]):
+        options = [
+            discord.SelectOption(label=role.name, value=str(role.id)) for role in user_roles
+        ]
+        super().__init__(placeholder="退出したいセクションを選択してください", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        role_id = int(self.values[0])
+        role_to_remove = interaction.guild.get_role(role_id)
+
+        if not role_to_remove or role_to_remove not in member.roles:
+            await interaction.response.edit_message(content="エラー: 対象のセクション（ロール）が見つからないか、参加していません。", view=None)
+            return
+
+        try:
+            await member.remove_roles(role_to_remove)
+            await interaction.response.edit_message(content=f"セクション「{role_to_remove.name}」から退出しました。", view=None)
+        except Exception as e:
+            print(f"!!! An unexpected error occurred in 'RemoveSectionSelect' callback: {e}")
+            await interaction.response.edit_message(content="セクションからの退出中にエラーが発生しました。", view=None)
 
 # --- ヘルパー関数 ---
 def get_rank_by_puuid(puuid: str) -> dict | None:
@@ -354,12 +486,79 @@ async def dashboard(ctx: discord.ApplicationContext, channel: discord.TextChanne
             f"このボタンからあなたのRiot IDを登録すると、あなたのSolo/Duoランクが24時間ごとに自動でチェックされ、サーバー内のラダーランキング(<#{NOTIFICATION_CHANNEL_ID}>)に反映されます。\n"
             "## Riot IDの登録解除\n"
             "ボットからあなたのRiot ID情報を削除します。\n"
+            "## セクションに参加\n"
+            "セクションのテキスト、ボイスチャンネルに参加します。\n"
+            "セクションの人数上限は50名です。\n"
         ),
         color=discord.Color.blue()
     )
 
     await target_channel.send(embed=embed, view=DashboardView())
     await ctx.respond("ダッシュボードを送信しました。", ephemeral=True)
+
+@bot.slash_command(name="add_section", description="参加可能なセクションを登録します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def add_section(ctx: discord.ApplicationContext, section_role: discord.Role, notification_channel: discord.TextChannel):
+    await ctx.defer(ephemeral=True)
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("INSERT OR REPLACE INTO sections (role_id, section_name, notification_channel_id) VALUES (?, ?, ?)",
+                    (section_role.id, section_role.name, notification_channel.id))
+        con.commit()
+        con.close()
+        await ctx.respond(f"セクション（ロール「{section_role.name}」）を、通知チャンネル「{notification_channel.name}」と紐付けて登録しました。")
+    except Exception as e:
+        print(f"!!! An unexpected error occurred in 'add_section' command: {e}")
+        await ctx.respond("セクションの登録中に予期せぬエラーが発生しました。")
+
+@bot.slash_command(name="remove_section", description="参加可能なセクションを削除します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def remove_section(ctx: discord.ApplicationContext, section_role: discord.Role):
+    await ctx.defer(ephemeral=True)
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("DELETE FROM sections WHERE role_id = ?", (section_role.id,))
+        con.commit()
+        
+        if con.total_changes > 0:
+            await ctx.respond(f"セクション（ロール「{section_role.name}」）をDBから削除しました。")
+        else:
+            await ctx.respond(f"指定されたセクション（ロール）はDBに登録されていません。")
+
+        con.close()
+    except Exception as e:
+        print(f"!!! An unexpected error occurred in 'remove_section' command: {e}")
+        await ctx.respond("セクションの削除中に予期せぬエラーが発生しました。")
+
+
+@bot.slash_command(name="remove_user_from_section", description="指定したユーザーをセクションから退出させます。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def remove_user_from_section(ctx: discord.ApplicationContext, user: discord.Member, section_role: discord.Role):
+    await ctx.defer(ephemeral=True)
+
+    # 指定されたロールがセクションとして登録されているか確認
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT 1 FROM sections WHERE role_id = ?", (section_role.id,))
+    is_section = cur.fetchone()
+    con.close()
+
+    if not is_section:
+        await ctx.respond(f"エラー: ロール「{section_role.name}」はセクションとして登録されていません。")
+        return
+
+    if section_role not in user.roles:
+        await ctx.respond(f"ユーザー「{user.display_name}」はセクション「{section_role.name}」に参加していません。")
+        return
+
+    try:
+        await user.remove_roles(section_role)
+        await ctx.respond(f"ユーザー「{user.display_name}」をセクション「{section_role.name}」から退出させました。")
+    except Exception as e:
+        print(f"!!! An unexpected error occurred in 'remove_user_from_section' command: {e}")
+        await ctx.respond("セクションからの退出処理中に予期せぬエラーが発生しました。")
 
 
 # --- デバッグ用コマンド ---
