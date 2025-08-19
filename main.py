@@ -114,7 +114,7 @@ class DashboardView(discord.ui.View):
 
         await interaction.response.send_message(content="参加したいセクションを選択してください。", view=SectionSelectView(available_sections), ephemeral=True, delete_after=180)
 
-    @discord.ui.button(label="セクションから退出", style=discord.ButtonStyle.secondary, custom_id="dashboard:leave_section", disabled=True)
+    @discord.ui.button(label="セクションから退出", style=discord.ButtonStyle.secondary, custom_id="dashboard:leave_section", disabled=False)
     async def remove_section_button(self, button: discord.ui.Button, interaction: discord.Interaction):
         member = interaction.user
         con = sqlite3.connect(DB_PATH)
