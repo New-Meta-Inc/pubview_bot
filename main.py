@@ -107,7 +107,7 @@ class DashboardView(discord.ui.View):
             role = guild.get_role(role_id)
             if role and len(role.members) < 50:
                 available_sections.append((role_id, section_name))
-        
+
         if not available_sections:
             await interaction.response.send_message("現在参加可能なセクションはありません。", ephemeral=True, delete_after=60)
             return
@@ -190,7 +190,7 @@ class SectionSelect(discord.ui.Select):
         ]
         if not options:
             options.append(discord.SelectOption(label="参加可能なセクションがありません", value="no_sections", default=True))
-        
+
         super().__init__(placeholder="参加したいセクションを選択してください", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
@@ -225,7 +225,7 @@ class SectionSelect(discord.ui.Select):
                 channel = bot.get_channel(channel_id)
                 if channel:
                     await channel.send(f"{member.mention}さんがセクション「{section_role.name}」に参加しました！")
-            
+
             await interaction.response.edit_message(content=f"セクション「{section_role.name}」に参加しました！", view=None)
         except Exception as e:
             print(f"!!! An unexpected error occurred in 'SectionSelect' callback: {e}")
@@ -339,6 +339,19 @@ async def create_ranking_embed() -> discord.Embed:
 
     embed.description = f"現在登録されているメンバーのランクです。\n{description_update_time}{description_footer}"
 
+    previous_tier = ""
+    role_emojis = {
+        "CHALLENGER": "👑",
+        "GRANDMASTER": "👑",
+        "MASTER": "👑",
+        "DIAMOND": "💎",
+        "EMERALD": "💚",
+        "PLATINUM": "💠",
+        "GOLD": "💛",
+        "SILVER": "🤍",
+        "BRONZE": "🥉",
+        "IRON": "⛓️",
+    }
     for i, player in enumerate(sorted_ranks[:20]):
         try:
             user = await bot.fetch_user(player['discord_id'])
@@ -348,6 +361,11 @@ async def create_ranking_embed() -> discord.Embed:
             mention_name = user.display_name
 
         riot_id_full = f"{player['game_name']}#{player['tag_line'].upper()}"
+
+        if previous_tier != player['tier']:
+            previous_tier = player['tier']
+            embed.add_field(name=f"─── {role_emojis[player['tier']]} {player['tier']} {role_emojis[player['tier']]} ───", value=f"", inline=False)
+
         embed.add_field(name=f"", value=f"{i+1}. {mention_name} ({riot_id_full})\n**{player['tier']} {player['rank']} / {player['lp']}LP**", inline=False)
 
     return embed
@@ -521,7 +539,7 @@ async def remove_section(ctx: discord.ApplicationContext, section_role: discord.
         cur = con.cursor()
         cur.execute("DELETE FROM sections WHERE role_id = ?", (section_role.id,))
         con.commit()
-        
+
         if con.total_changes > 0:
             await ctx.respond(f"セクション（ロール「{section_role.name}」）をDBから削除しました。")
         else:
