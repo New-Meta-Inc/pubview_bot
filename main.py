@@ -341,16 +341,16 @@ async def create_ranking_embed() -> discord.Embed:
 
     previous_tier = ""
     role_emojis = {
-        "CHALLENGER": "👑",
-        "GRANDMASTER": "👑",
-        "MASTER": "👑",
-        "DIAMOND": "💎",
-        "EMERALD": "💚",
-        "PLATINUM": "💠",
-        "GOLD": "💛",
-        "SILVER": "🤍",
-        "BRONZE": "🥉",
-        "IRON": "⛓️",
+        "CHALLENGER": "<:challenger:1407917898445357107>",
+        "GRANDMASTER": "<:grandmaster:1407917001401434234>",
+        "MASTER": "<:master:1407917005524176948>",
+        "DIAMOND": "<:diamond:1407916987518156901>",
+        "EMERALD": "<:emerald:1407916989581754458>",
+        "PLATINUM": "<:plat:1407917008611184762>",
+        "GOLD": "<:gold:1407916997303603303>",
+        "SILVER": "<:silver:1407917015884103851>",
+        "BRONZE": "<:bronze:1407917860763992167>",
+        "IRON": "<:iron:1407917003397795901>",
     }
     for i, player in enumerate(sorted_ranks[:20]):
         try:
@@ -364,7 +364,28 @@ async def create_ranking_embed() -> discord.Embed:
 
         if previous_tier != player['tier']:
             previous_tier = player['tier']
-            embed.add_field(name=f"─── {role_emojis[player['tier']]} {player['tier']} {role_emojis[player['tier']]} ───", value=f"", inline=False)
+            if player['tier'] == "CHALLENGER":
+                t = f"{role_emojis[player['tier']]} CHALLENGER {role_emojis[player['tier']]} ──────"
+            elif player['tier'] == "GRANDMASTER":
+                t = f"{role_emojis[player['tier']]} GRANDMASTER {role_emojis[player['tier']]} ─────"
+            elif player['tier'] == "MASTER":
+                t = f"{role_emojis[player['tier']]} MASTER {role_emojis[player['tier']]} ──────────"
+            elif player['tier'] == "DIAMOND":
+                t = f"{role_emojis[player['tier']]} DIAMOND {role_emojis[player['tier']]} ─────────"
+            elif player['tier'] == "EMERALD":
+                t = f"{role_emojis[player['tier']]} EMERALD {role_emojis[player['tier']]} ─────────"
+            elif player['tier'] == "PLATINUM":
+                t = f"{role_emojis[player['tier']]} PLATINUM {role_emojis[player['tier']]} ────────"
+            elif player['tier'] == "GOLD":
+                t = f"{role_emojis[player['tier']]} GOLD {role_emojis[player['tier']]} ────────────"
+            elif player['tier'] == "SILVER":
+                t = f"{role_emojis[player['tier']]} SILVER {role_emojis[player['tier']]} ──────────"
+            elif player['tier'] == "BRONZE":
+                t = f"{role_emojis[player['tier']]} BRONZE {role_emojis[player['tier']]} ──────────"
+            elif player['tier'] == "IRON":
+                t = f"{role_emojis[player['tier']]} IRON {role_emojis[player['tier']]} ────────────"
+
+            embed.add_field(name=f"", value=f"{t}", inline=False)
 
         embed.add_field(name=f"", value=f"{i+1}. {mention_name} ({riot_id_full})\n**{player['tier']} {player['rank']} / {player['lp']}LP**", inline=False)
 
