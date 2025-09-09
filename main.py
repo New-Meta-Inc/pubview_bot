@@ -352,42 +352,61 @@ async def create_ranking_embed() -> discord.Embed:
         "BRONZE": "<:bronze:1407917860763992167>",
         "IRON": "<:iron:1407917003397795901>",
     }
-    for i, player in enumerate(sorted_ranks[:20]):
-        try:
-            user = await bot.fetch_user(player['discord_id'])
-            # メンション形式でユーザー名を表示
-            mention_name = user.mention
-        except discord.NotFound:
-            mention_name = user.display_name
 
-        riot_id_full = f"{player['game_name']}#{player['tag_line'].upper()}"
+    # ティアごとにプレイヤーをグループ化
+    players_by_tier = {}
+    for player in sorted_ranks:
+        tier = player['tier']
+        if tier not in players_by_tier:
+            players_by_tier[tier] = []
+        players_by_tier[tier].append(player)
 
-        if previous_tier != player['tier']:
-            previous_tier = player['tier']
-            if player['tier'] == "CHALLENGER":
-                t = f"{role_emojis[player['tier']]} CHALLENGER {role_emojis[player['tier']]} ──────"
-            elif player['tier'] == "GRANDMASTER":
-                t = f"{role_emojis[player['tier']]} GRANDMASTER {role_emojis[player['tier']]} ─────"
-            elif player['tier'] == "MASTER":
-                t = f"{role_emojis[player['tier']]} MASTER {role_emojis[player['tier']]} ──────────"
-            elif player['tier'] == "DIAMOND":
-                t = f"{role_emojis[player['tier']]} DIAMOND {role_emojis[player['tier']]} ─────────"
-            elif player['tier'] == "EMERALD":
-                t = f"{role_emojis[player['tier']]} EMERALD {role_emojis[player['tier']]} ─────────"
-            elif player['tier'] == "PLATINUM":
-                t = f"{role_emojis[player['tier']]} PLATINUM {role_emojis[player['tier']]} ────────"
-            elif player['tier'] == "GOLD":
-                t = f"{role_emojis[player['tier']]} GOLD {role_emojis[player['tier']]} ────────────"
-            elif player['tier'] == "SILVER":
-                t = f"{role_emojis[player['tier']]} SILVER {role_emojis[player['tier']]} ──────────"
-            elif player['tier'] == "BRONZE":
-                t = f"{role_emojis[player['tier']]} BRONZE {role_emojis[player['tier']]} ──────────"
-            elif player['tier'] == "IRON":
-                t = f"{role_emojis[player['tier']]} IRON {role_emojis[player['tier']]} ────────────"
+    # ティアの順序を定義
+    tier_order = ["CHALLENGER", "GRANDMASTER", "MASTER", "DIAMOND", "EMERALD", "PLATINUM", "GOLD", "SILVER", "BRONZE", "IRON"]
 
-            embed.add_field(name=f"", value=f"{t}", inline=False)
+    # ティアごとにフィールドを追加
+    rank_counter = 1
+    for tier in tier_order:
+        if tier in players_by_tier:
+            tier_players = players_by_tier[tier]
+            field_value = ""
+            for player in tier_players:
+                try:
+                    user = await bot.fetch_user(player['discord_id'])
+                    mention_name = user.mention
+                except discord.NotFound:
+                    # サーバーにいないユーザーは display_name を使う（取得できない場合は'N/A'）
+                    try:
+                        user = await bot.fetch_user(player['discord_id'])
+                        mention_name = user.display_name
+                    except:
+                        mention_name = "N/A"
 
-        embed.add_field(name=f"", value=f"{i+1}. {mention_name} ({riot_id_full})\n**{player['tier']} {player['rank']} / {player['lp']}LP**", inline=False)
+
+                riot_id_full = f"{player['game_name']}#{player['tag_line'].upper()}"
+                # ランク情報の太字を解除
+                field_value += f"{rank_counter}. {mention_name} ({riot_id_full})\n{player['tier']} {player['rank']} / {player['lp']}LP\n"
+                rank_counter += 1
+
+            if field_value:
+                # フィールドのvalue上限(1024文字)を超えないように調整
+                if len(field_value) > 1024:
+                    field_value = field_value[:1020] + "..."
+                
+                # Tierヘッダーのデザインを調整
+                # Tier名の長さに応じて罫線の数を変え、全体の長さを揃える
+                base_length = 28
+                header_core_length = len(tier) + 4 # 太字化の** **分
+                padding_count = max(0, base_length - header_core_length)
+                padding = "─" * padding_count
+                
+                header_text = f"{role_emojis[tier]} {tier} {role_emojis[tier]} {padding}"
+
+                embed.add_field(
+                    name=f"**{header_text}**",
+                    value=field_value,
+                    inline=False
+                )
 
     return embed
 
@@ -678,6 +697,7 @@ async def check_ranks_periodically() -> None:
         con.close()
         return
 
+    promoted_users = []
     for discord_id, puuid, old_tier, old_rank, game_name, tag_line in registered_users:
         try:
             new_rank_info = get_rank_by_puuid(puuid)
@@ -691,6 +711,21 @@ async def check_ranks_periodically() -> None:
                             (new_rank_info['tier'], new_rank_info['rank'], new_rank_info['leaguePoints'], discord_id))
             else:
                 cur.execute("UPDATE users SET tier = NULL, rank = NULL, league_points = NULL WHERE discord_id = ?", (discord_id,))
+
+            # --- ランクアップ判定 ---
+            if new_rank_info and old_tier and old_rank:
+                old_value = rank_to_value(old_tier, old_rank, 0)
+                new_value = rank_to_value(new_rank_info['tier'], new_rank_info['rank'], 0)
+                if new_value > old_value:
+                    promoted_users.append({
+                        "member": member,
+                        "game_name": game_name,
+                        "tag_line": tag_line,
+                        "old_tier": old_tier,
+                        "old_rank": old_rank,
+                        "new_tier": new_rank_info['tier'],
+                        "new_rank": new_rank_info['rank']
+                    })
 
             # --- ランク連動ロール処理 ---
             current_rank_tier = new_rank_info['tier'].upper() if new_rank_info else None
@@ -731,16 +766,14 @@ async def check_ranks_periodically() -> None:
     # --- 定期ランキング速報処理 ---
     if channel:
         ranking_embed = await create_ranking_embed()
-    if ranking_embed:
-        await channel.send("【定期ランキング速報】", embed=ranking_embed)
+        if ranking_embed:
+            await channel.send("【定期ランキング速報】", embed=ranking_embed)
 
     # --- ランクアップ通知処理 ---
-    if new_rank_info and old_tier and old_rank:
-        old_value = rank_to_value(old_tier, old_rank, 0)
-        new_value = rank_to_value(new_rank_info['tier'], new_rank_info['rank'], 0)
-        if new_value > old_value:
-            riot_id_full = f"{game_name}#{tag_line.upper()}"
-            await channel.send(f"🎉 **ランクアップ！** 🎉\nおめでとうございます、{member.mention}さん ({riot_id_full})！\n**{old_tier} {old_rank}** → **{new_rank_info['tier']} {new_rank_info['rank']}** に昇格しました！")
+    if channel and promoted_users:
+        for user_data in promoted_users:
+            riot_id_full = f"{user_data['game_name']}#{user_data['tag_line'].upper()}"
+            await channel.send(f"🎉 **ランクアップ！** 🎉\nおめでとうございます、{user_data['member'].mention}さん ({riot_id_full})！\n**{user_data['old_tier']} {user_data['old_rank']}** → **{user_data['new_tier']} {user_data['new_rank']}** に昇格しました！")
 
     print("--- Periodic rank check finished ---")
 
