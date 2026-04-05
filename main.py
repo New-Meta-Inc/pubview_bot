@@ -18,7 +18,7 @@ DB_PATH: str = '/data/lol_bot.db'
 NOTIFICATION_CHANNEL_ID: int = 1402091279700983819 # 通知用チャンネルID
 HONOR_CHANNEL_ID: int = 1447166222591594607 # 名誉用チャンネルID
 VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125
-RANK_GAME_CHANNEL_ID: int = 1490173573426577440
+RANK_GAME_CHANNEL_ID: int = 1470346492895166566
 RANK_ROLES: dict[str, str] = {
     "IRON": "LoL Iron(Solo/Duo)", "BRONZE": "LoL Bronze(Solo/Duo)", "SILVER": "LoL Silver(Solo/Duo)",
     "GOLD": "LoL Gold(Solo/Duo)", "PLATINUM": "LoL Platinum(Solo/Duo)", "EMERALD": "LoL Emerald(Solo/Duo)",
