@@ -17,7 +17,8 @@ DISCORD_GUILD_ID: int = int(os.getenv('DISCORD_GUILD_ID'))
 DB_PATH: str = '/data/lol_bot.db'
 NOTIFICATION_CHANNEL_ID: int = 1402091279700983819 # 通知用チャンネルID
 HONOR_CHANNEL_ID: int = 1447166222591594607 # 名誉用チャンネルID
-VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125  # このチャンネルに入室すると「通話」カテゴリ内に新規ボイスチャンネルが作成される
+VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125
+RANK_GAME_CHANNEL_ID: int = 1470346492895166566
 RANK_ROLES: dict[str, str] = {
     "IRON": "LoL Iron(Solo/Duo)", "BRONZE": "LoL Bronze(Solo/Duo)", "SILVER": "LoL Silver(Solo/Duo)",
     "GOLD": "LoL Gold(Solo/Duo)", "PLATINUM": "LoL Platinum(Solo/Duo)", "EMERALD": "LoL Emerald(Solo/Duo)",
@@ -824,7 +825,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     category: discord.CategoryChannel | None = discord.utils.get(guild.categories, id=1469467787356410030)
 
     # 新規ボイスチャンネル作成（指定チャンネルに入室した場合）
-    if after.channel and after.channel.id == VOICE_CREATE_CHANNEL_ID:
+    if after.channel and (after.channel.id == VOICE_CREATE_CHANNEL_ID or after.channel.id == RANK_GAME_CHANNEL_ID):
         if not category:
             return
         try:
@@ -833,18 +834,22 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
                 category=category,
                 user_limit=0,  # 0=制限なし
             )
+            if after.channel.id == RANK_GAME_CHANNEL_ID:
+                await new_channel.set_permissions(guild.default_role, stream=False)
+                await new_channel.set_permissions(member, stream=True)
             await member.move_to(new_channel)
         except Exception as e:
             print(f"!!! ボイスチャンネル作成エラー: {e}")
 
     # 空チャンネル削除（退出したチャンネルが空になった場合）
-    if before.channel and category and before.channel.id != VOICE_CREATE_CHANNEL_ID and before.channel.category_id == category.id:
+    if before.channel and category and before.channel.category_id == category.id:
+        if before.channel.id == VOICE_CREATE_CHANNEL_ID or before.channel.id == RANK_GAME_CHANNEL_ID:
+            return
         if len(before.channel.members) == 0:
             try:
                 await before.channel.delete()
             except Exception as e:
                 print(f"!!! 空チャンネル削除エラー: {e}")
-
 
 # --- Botの起動 ---
 if __name__ == '__main__':
