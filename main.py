@@ -829,8 +829,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if not category:
             return
         try:
+            channel_name: str = "👀｜ランク戦見守り部屋" if after.channel.id == RANK_GAME_CHANNEL_ID else "".join(random.choices(string.ascii_letters + string.digits, k=5))
             new_channel: discord.VoiceChannel = await guild.create_voice_channel(
-                name="".join(random.choices(string.ascii_letters + string.digits, k=5)),
+                name=channel_name,
                 category=category,
                 user_limit=0,  # 0=制限なし
             )
