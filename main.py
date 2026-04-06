@@ -842,7 +842,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
             print(f"!!! ボイスチャンネル作成エラー: {e}")
 
     # 空チャンネル削除（退出したチャンネルが空になった場合）
-    if before.channel and category and (before.channel.id != VOICE_CREATE_CHANNEL_ID or before.channel.id != RANK_GAME_CHANNEL_ID) and before.channel.category_id == category.id:
+    if before.channel and category and before.channel.category_id == category.id:
+        if before.channel.id == VOICE_CREATE_CHANNEL_ID or before.channel.id == RANK_GAME_CHANNEL_ID:
+            return
         if len(before.channel.members) == 0:
             try:
                 await before.channel.delete()
