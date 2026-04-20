@@ -448,9 +448,18 @@ async def create_ranking_embed() -> discord.Embed:
     return embed
 
 # --- イベント ---
+_startup_done: bool = False
+
 @bot.event
 async def on_ready() -> None:
+    global _startup_done
     print(f"Bot logged in as {bot.user}")
+
+    # on_readyは再接続のたびに発火するため、初回起動時のみ初期化処理を実行
+    if _startup_done:
+        print("--- Reconnected (skipping initial setup) ---")
+        return
+    _startup_done = True
 
     # Bot起動時に永続Viewを登録
     bot.add_view(DashboardView())
@@ -462,7 +471,8 @@ async def on_ready() -> None:
         if ranking_embed:
             await channel.send("【起動時ランキング速報】", embed=ranking_embed)
 
-    check_ranks_periodically.start()
+    if not check_ranks_periodically.is_running():
+        check_ranks_periodically.start()
 
 # --- コマンド ---
 @bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。", guild_ids=[DISCORD_GUILD_ID])
