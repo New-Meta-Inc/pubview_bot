@@ -938,6 +938,184 @@ async def score(ctx: discord.ApplicationContext) -> None:
     await ctx.respond(embed=embed, ephemeral=True)
 
 
+# --- /leaderboard / /house_standings: 貢献度ランキング系 ---
+HOUSE_BY_ID: dict[str, tuple[str, str, str, str]] = {h[0]: h for h in HOUSES}
+
+
+def _house_emoji(house_id: str) -> str:
+    h: tuple[str, str, str, str] | None = HOUSE_BY_ID.get(house_id)
+    return h[2] if h else "❔"
+
+
+def _house_name(house_id: str) -> str:
+    h: tuple[str, str, str, str] | None = HOUSE_BY_ID.get(house_id)
+    return h[1] if h else "?"
+
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+
+@bot.slash_command(
+    name="leaderboard",
+    description="個人のコントリビューションランキング（Top10）を表示します。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+async def leaderboard(
+    ctx: discord.ApplicationContext,
+    mode: discord.Option(  # type: ignore[valid-type]
+        str,
+        "並び替え基準",
+        choices=["monthly", "total"],
+        default="monthly",
+    ),
+) -> None:
+    """組分け済みメンバーの貢献度Top10。mode=monthly: 今月pt順 / mode=total: 累積XP順"""
+    await ctx.defer()
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    ym: str = current_year_month_jst()
+
+    if mode == "total":
+        cur.execute(
+            """
+            SELECT s.discord_id, s.house_id,
+                   COALESCE(t.total_xp, 0)   AS total_xp,
+                   COALESCE(m.points, 0)     AS month_pt
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+            LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+            ORDER BY total_xp DESC
+            LIMIT 10
+            """,
+            (ym,),
+        )
+        title: str = "🏆 累積XPランキング（Top 10）"
+        primary_label: str = "XP"
+    else:
+        cur.execute(
+            """
+            SELECT s.discord_id, s.house_id,
+                   COALESCE(t.total_xp, 0)   AS total_xp,
+                   COALESCE(m.points, 0)     AS month_pt
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+            LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+            ORDER BY month_pt DESC, total_xp DESC
+            LIMIT 10
+            """,
+            (ym,),
+        )
+        title: str = f"🏆 今月の貢献度ランキング（{ym} / Top 10）"
+        primary_label: str = "pt"
+
+    rows: list[tuple[int, str, int, int]] = cur.fetchall()
+    con.close()
+
+    embed: discord.Embed = discord.Embed(title=title, color=discord.Color.gold())
+    if not rows:
+        embed.description = "まだ組分けされたメンバーがいないか、貢献度の記録がありません。"
+        await ctx.respond(embed=embed)
+        return
+
+    lines: list[str] = []
+    guild: discord.Guild | None = ctx.guild
+    for i, (discord_id, house_id, total_xp, month_pt) in enumerate(rows, start=1):
+        member_name: str = f"<@{discord_id}>"
+        # ユーザー削除済みのフォールバック
+        if guild is not None:
+            member: discord.Member | None = guild.get_member(discord_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(discord_id)
+                except Exception:
+                    member = None
+            if member is not None:
+                member_name = member.mention
+        lv: int = level_from_xp(total_xp)
+        value: int = total_xp if mode == "total" else month_pt
+        lines.append(
+            f"`#{i:>2}` {_house_emoji(house_id)} {member_name} ・ Lv {lv} ・ **{_fmt_int(value)} {primary_label}**"
+        )
+
+    embed.description = "\n".join(lines)
+    embed.set_footer(
+        text=(
+            "mode=total: 累積XP順 / mode=monthly: 今月pt順"
+            f"\nWebダッシュボード: https://pubview-dashboard.pages.dev/"
+        )
+    )
+    await ctx.respond(embed=embed)
+
+
+@bot.slash_command(
+    name="house_standings",
+    description="4寮のコントリビューション対抗状況を表示します。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+async def house_standings(ctx: discord.ApplicationContext) -> None:
+    """寮ごとの 寮Lv / 累積XP / 今月pt / メンバー数 を1枚で表示。"""
+    await ctx.defer()
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    ym: str = current_year_month_jst()
+
+    cur.execute(
+        """
+        SELECT s.house_id,
+               COUNT(DISTINCT s.discord_id)   AS member_count,
+               COALESCE(SUM(t.total_xp), 0)    AS total_xp,
+               COALESCE(SUM(m.points),  0)    AS month_pt
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+        LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+        GROUP BY s.house_id
+        """,
+        (ym,),
+    )
+    stats_by_house: dict[str, tuple[int, int, int]] = {
+        row[0]: (row[1], row[2], row[3]) for row in cur.fetchall()
+    }
+    con.close()
+
+    embed: discord.Embed = discord.Embed(
+        title=f"🏰 寮対抗スタンディング（{ym}）",
+        color=discord.Color.dark_purple(),
+    )
+
+    # 寮Lv 順、同点は今月pt降順
+    ordered: list[tuple[str, int, int, int, int]] = []
+    for house_id, name_jp, emoji, _role in HOUSES:
+        member_count, total_xp, month_pt = stats_by_house.get(house_id, (0, 0, 0))
+        house_lv: int = level_from_xp(total_xp, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        ordered.append((house_id, member_count, total_xp, month_pt, house_lv))
+    ordered.sort(key=lambda x: (-x[4], -x[3]))
+
+    for i, (house_id, member_count, total_xp, month_pt, house_lv) in enumerate(ordered, start=1):
+        h_name: str = _house_name(house_id)
+        h_emoji: str = _house_emoji(house_id)
+        cur_xp: int = required_xp_for_level(house_lv, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        next_xp: int = required_xp_for_level(house_lv + 1, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        in_lv: int = total_xp - cur_xp
+        span: int = max(1, next_xp - cur_xp)
+        bar_filled: int = max(0, min(10, round((in_lv / span) * 10)))
+        bar: str = "▰" * bar_filled + "▱" * (10 - bar_filled)
+        embed.add_field(
+            name=f"`#{i}` {h_emoji} {h_name}  ・ 寮Lv {house_lv}",
+            value=(
+                f"{bar} {_fmt_int(in_lv)}/{_fmt_int(next_xp - cur_xp)} XP\n"
+                f"累積 **{_fmt_int(total_xp)} XP** ・ 今月 **{_fmt_int(month_pt)} pt** ・ メンバー {member_count}人"
+            ),
+            inline=False,
+        )
+
+    embed.set_footer(text="Webダッシュボード: https://pubview-dashboard.pages.dev/")
+    await ctx.respond(embed=embed)
+# -----------------------------
+
+
 @bot.slash_command(name="ranking", description="サーバー内のLoLランクランキングを表示します。", guild_ids=[DISCORD_GUILD_ID])
 async def ranking(ctx: discord.ApplicationContext) -> None:
     await ctx.defer()
