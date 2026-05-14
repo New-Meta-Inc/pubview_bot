@@ -59,6 +59,24 @@ RATE_BRACKET_OF_TIER: dict[str, str] = {
 }
 # ----------------
 
+# --- コントリビューション機能の設定 ---
+# ポイント発生源（バランス調整時はここを変更）
+CONTRIBUTION_VC_PT_PER_MINUTE: int = 1
+CONTRIBUTION_TEXT_PT_PER_MESSAGE: int = 2
+CONTRIBUTION_TEXT_COOLDOWN_SECONDS: int = 60
+
+# レベル式: 累積XP = COEF * level^EXP に達したら次のレベル
+# 個人:  Lv N 必要累積XP = 20 * N^2   （Lv50 ≈ 50,000 XP）
+# 寮:    Lv N 必要累積XP = 300 * N^2  （個人式の15倍重い、特典設計用に長期目標化）
+CONTRIBUTION_USER_LEVEL_COEF: int = 20
+CONTRIBUTION_USER_LEVEL_EXP: float = 2.0
+CONTRIBUTION_HOUSE_LEVEL_COEF: int = 300
+CONTRIBUTION_HOUSE_LEVEL_EXP: float = 2.0
+# -----------------------------
+
+# JST（モジュール全体で共用）
+jst: datetime.timezone = datetime.timezone(datetime.timedelta(hours=9))
+
 # --- データベースの初期設定 ---
 def setup_database() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -92,8 +110,148 @@ def setup_database() -> None:
             sorted_at TEXT NOT NULL
         )
     ''')
+    # コントリビューション: 個人累積（永続）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS contribution_totals (
+            discord_id INTEGER PRIMARY KEY,
+            total_xp INTEGER NOT NULL DEFAULT 0,
+            vc_seconds INTEGER NOT NULL DEFAULT 0,
+            text_messages INTEGER NOT NULL DEFAULT 0,
+            last_text_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    # コントリビューション: 月次集計（JST月初リセット相当、年月キーで分離）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS contribution_monthly (
+            year_month TEXT NOT NULL,
+            discord_id INTEGER NOT NULL,
+            points INTEGER NOT NULL DEFAULT 0,
+            vc_seconds INTEGER NOT NULL DEFAULT 0,
+            text_messages INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (year_month, discord_id)
+        )
+    ''')
+    # コントリビューション: VC在室セッション（joinで記録、leaveで秒数確定→totals/monthly加算）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS vc_sessions (
+            discord_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL
+        )
+    ''')
     con.commit()
     con.close()
+# -----------------------------
+
+# --- コントリビューション機能のヘルパー ---
+def is_sorted(discord_id: int) -> bool:
+    """組分け帽子を被ったメンバーかどうか"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT 1 FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    found: bool = cur.fetchone() is not None
+    con.close()
+    return found
+
+
+def current_year_month_jst() -> str:
+    """JST基準の '%Y-%m' 文字列。月次集計のキーに使用"""
+    return datetime.datetime.now(jst).strftime("%Y-%m")
+
+
+def required_xp_for_level(level: int, coef: int = CONTRIBUTION_USER_LEVEL_COEF, exp: float = CONTRIBUTION_USER_LEVEL_EXP) -> int:
+    """指定レベルに到達するために必要な累積XP（Lv1は0XP）"""
+    if level <= 1:
+        return 0
+    return int(coef * (level ** exp))
+
+
+def level_from_xp(xp: int, coef: int = CONTRIBUTION_USER_LEVEL_COEF, exp: float = CONTRIBUTION_USER_LEVEL_EXP) -> int:
+    """累積XPからレベルを算出。Lv N 必要XP = coef * N^exp の逆算"""
+    if xp <= 0:
+        return 1
+    raw_level: float = (xp / coef) ** (1.0 / exp)
+    return max(1, int(raw_level))
+
+
+def add_contribution(discord_id: int, xp: int, vc_seconds: int, text_messages: int, last_text_at_iso: str | None = None) -> None:
+    """totals と monthly に同時加算。組分け済みであることは呼び出し側で保証する。"""
+    if xp == 0 and vc_seconds == 0 and text_messages == 0:
+        return
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ym: str = current_year_month_jst()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    # totals
+    cur.execute(
+        """
+        INSERT INTO contribution_totals (discord_id, total_xp, vc_seconds, text_messages, last_text_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(discord_id) DO UPDATE SET
+            total_xp = total_xp + excluded.total_xp,
+            vc_seconds = vc_seconds + excluded.vc_seconds,
+            text_messages = text_messages + excluded.text_messages,
+            last_text_at = COALESCE(excluded.last_text_at, contribution_totals.last_text_at),
+            updated_at = excluded.updated_at
+        """,
+        (discord_id, xp, vc_seconds, text_messages, last_text_at_iso, now_iso),
+    )
+    # monthly
+    cur.execute(
+        """
+        INSERT INTO contribution_monthly (year_month, discord_id, points, vc_seconds, text_messages)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(year_month, discord_id) DO UPDATE SET
+            points = points + excluded.points,
+            vc_seconds = vc_seconds + excluded.vc_seconds,
+            text_messages = text_messages + excluded.text_messages
+        """,
+        (ym, discord_id, xp, vc_seconds, text_messages),
+    )
+    con.commit()
+    con.close()
+
+
+def vc_session_start(discord_id: int, channel_id: int) -> None:
+    """VC参加を記録。組分け済みのみ実行する想定（呼び出し側でフィルタ）"""
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO vc_sessions (discord_id, channel_id, joined_at) VALUES (?, ?, ?)",
+        (discord_id, channel_id, now_iso),
+    )
+    con.commit()
+    con.close()
+
+
+def vc_session_end(discord_id: int) -> int:
+    """VC退出時に在室秒数を確定し、totals/monthly へ加算。在室秒数を返す。"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT joined_at FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    if not row:
+        con.close()
+        return 0
+    try:
+        joined_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+    except ValueError:
+        cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+        con.commit()
+        con.close()
+        return 0
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    seconds: int = max(0, int((now_utc - joined_at).total_seconds()))
+    cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    con.commit()
+    con.close()
+    if seconds > 0:
+        # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
+        added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
+        add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
+    return seconds
 # -----------------------------
 
 # --- Botの初期設定 ---
@@ -584,6 +742,19 @@ async def on_ready() -> None:
 
     # Bot起動時に永続Viewを登録
     bot.add_view(DashboardView())
+
+    # --- コントリビューション: 起動時のVC在室者スキャン ---
+    # 再起動を跨いで在室している組分け済みメンバーを vc_sessions に再登録する
+    # （再起動中の時間はロストする。今この瞬間からの計測再開）
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            for vc_member in vc.members:
+                if vc_member.bot:
+                    continue
+                if is_sorted(vc_member.id):
+                    vc_session_start(vc_member.id, vc.id)
+    print("--- VC sessions re-initialized for sorted members ---")
+
     # 起動時ランキング速報は一旦停止（再開する場合は下記ブロックを有効化）
     # print("--- Posting initial ranking on startup ---")
     # channel: discord.TextChannel | discord.VoiceChannel | discord.Thread | None = bot.get_channel(NOTIFICATION_CHANNEL_ID)
@@ -683,6 +854,79 @@ async def unregister(ctx: discord.ApplicationContext) -> None:
 
     except Exception as e:
         await ctx.respond("登録解除中に予期せぬエラーが発生しました。")
+
+@bot.slash_command(name="score", description="あなたの貢献度・レベル・今月のポイントを表示します。", guild_ids=[DISCORD_GUILD_ID])
+async def score(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    discord_id: int = ctx.author.id
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    house_row: tuple[str] | None = cur.fetchone()
+    if not house_row:
+        con.close()
+        await ctx.respond(
+            "まだ組分け帽子を被っていません。ダッシュボードから組分けすると貢献度が貯まり始めます。",
+            ephemeral=True,
+        )
+        return
+    house_info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_row[0]), None)
+
+    cur.execute(
+        "SELECT total_xp, vc_seconds, text_messages FROM contribution_totals WHERE discord_id = ?",
+        (discord_id,),
+    )
+    totals_row: tuple[int, int, int] | None = cur.fetchone()
+    total_xp: int = totals_row[0] if totals_row else 0
+    vc_seconds: int = totals_row[1] if totals_row else 0
+    text_messages: int = totals_row[2] if totals_row else 0
+
+    ym: str = current_year_month_jst()
+    cur.execute(
+        "SELECT points, vc_seconds, text_messages FROM contribution_monthly WHERE year_month = ? AND discord_id = ?",
+        (ym, discord_id),
+    )
+    monthly_row: tuple[int, int, int] | None = cur.fetchone()
+    monthly_pt: int = monthly_row[0] if monthly_row else 0
+    monthly_vc: int = monthly_row[1] if monthly_row else 0
+    monthly_text: int = monthly_row[2] if monthly_row else 0
+    con.close()
+
+    level: int = level_from_xp(total_xp)
+    current_level_xp: int = required_xp_for_level(level)
+    next_level_xp: int = required_xp_for_level(level + 1)
+    xp_into_current: int = total_xp - current_level_xp
+    xp_needed: int = next_level_xp - current_level_xp
+
+    embed: discord.Embed = discord.Embed(
+        title=f"📊 {ctx.author.display_name} の貢献度",
+        color=discord.Color.blurple(),
+    )
+    if house_info:
+        embed.add_field(name="所属", value=f"{house_info[2]} {house_info[1]}", inline=False)
+    embed.add_field(name="個人レベル", value=f"Lv {level}", inline=True)
+    embed.add_field(name="累積XP", value=f"{total_xp:,}", inline=True)
+    embed.add_field(name="次Lvまで", value=f"{xp_into_current:,} / {xp_needed:,} XP", inline=True)
+    embed.add_field(
+        name=f"今月（{ym}）",
+        value=(
+            f"**{monthly_pt:,} pt**\n"
+            f"VC {monthly_vc // 3600}時間{(monthly_vc % 3600) // 60}分 / "
+            f"投稿 {monthly_text:,}件"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="累積アクティビティ",
+        value=(
+            f"VC {vc_seconds // 3600}時間{(vc_seconds % 3600) // 60}分 / "
+            f"投稿 {text_messages:,}件"
+        ),
+        inline=False,
+    )
+    await ctx.respond(embed=embed, ephemeral=True)
+
 
 @bot.slash_command(name="ranking", description="サーバー内のLoLランクランキングを表示します。", guild_ids=[DISCORD_GUILD_ID])
 async def ranking(ctx: discord.ApplicationContext) -> None:
@@ -846,7 +1090,6 @@ async def debug_modify_rank(ctx: discord.ApplicationContext, user: discord.Membe
         await ctx.respond(f"処理中にエラーが発生しました: {e}")
 
 # --- バックグラウンドタスク ---
-jst: datetime.timezone = datetime.timezone(datetime.timedelta(hours=9))
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=jst))
 async def check_ranks_periodically() -> None:
     print("--- Starting periodic rank check ---")
@@ -949,7 +1192,48 @@ async def check_ranks_periodically() -> None:
     print("--- Periodic rank check finished ---")
 
 @bot.event
+async def on_message(message: discord.Message) -> None:
+    # Bot自身・DM・システムメッセージは除外
+    if message.author.bot or message.guild is None:
+        return
+    discord_id: int = message.author.id
+    if not is_sorted(discord_id):
+        return
+    # 60秒クールダウン判定
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT last_text_at FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[str | None] | None = cur.fetchone()
+    con.close()
+    if row and row[0]:
+        try:
+            last_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+            if (now_utc - last_at).total_seconds() < CONTRIBUTION_TEXT_COOLDOWN_SECONDS:
+                return
+        except ValueError:
+            pass
+    add_contribution(
+        discord_id,
+        xp=CONTRIBUTION_TEXT_PT_PER_MESSAGE,
+        vc_seconds=0,
+        text_messages=1,
+        last_text_at_iso=now_utc.isoformat(),
+    )
+
+
+@bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    # --- コントリビューション: VC在室秒数の計測 ---
+    # チャンネルが変わったとき（join / leave / move）のみ処理
+    if not member.bot and before.channel != after.channel:
+        # 旧セッションを確定（退出 or 移動元）
+        if before.channel is not None:
+            vc_session_end(member.id)
+        # 新セッション開始（入室 or 移動先）。組分け済みのみ計測対象
+        if after.channel is not None and is_sorted(member.id):
+            vc_session_start(member.id, after.channel.id)
+
     guild: discord.Guild = member.guild
     category: discord.CategoryChannel | None = discord.utils.get(guild.categories, id=1469467787356410030)
 
