@@ -150,6 +150,17 @@ def setup_database() -> None:
             PRIMARY KEY (house_id, channel_type)
         )
     ''')
+    # 週次スナップショット: 週次ダイジェストの「先週比」算定に使用
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS weekly_snapshots (
+            snapshot_date  TEXT NOT NULL,
+            discord_id     INTEGER NOT NULL,
+            total_xp       INTEGER NOT NULL DEFAULT 0,
+            vc_seconds     INTEGER NOT NULL DEFAULT 0,
+            text_messages  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (snapshot_date, discord_id)
+        )
+    ''')
     con.commit()
     con.close()
 # -----------------------------
@@ -866,6 +877,10 @@ async def on_ready() -> None:
 
     if not check_ranks_periodically.is_running():
         check_ranks_periodically.start()
+    if not weekly_digest_task.is_running():
+        weekly_digest_task.start()
+    if not monthly_summary_task.is_running():
+        monthly_summary_task.start()
 
 # --- コマンド ---
 @bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。", guild_ids=[DISCORD_GUILD_ID])
@@ -1573,6 +1588,352 @@ async def debug_grant_xp(
     await ctx.respond(msg, ephemeral=True)
 
 
+# --- 週次ダイジェスト / 月次サマリ ---
+DASHBOARD_URL: str = "https://pubview-dashboard.pages.dev/"
+
+
+def _bar10(progress: float) -> str:
+    """0.0〜1.0 を10段階のバー文字列に。"""
+    filled: int = max(0, min(10, round(progress * 10)))
+    return "▰" * filled + "▱" * (10 - filled)
+
+
+def _this_jst_monday(now_jst: datetime.datetime | None = None) -> datetime.date:
+    """今週月曜日のJST日付（土曜だったら今週月曜＝5日前）。"""
+    if now_jst is None:
+        now_jst = datetime.datetime.now(jst)
+    return (now_jst.date() - datetime.timedelta(days=now_jst.weekday()))
+
+
+def save_weekly_snapshot(snapshot_date: datetime.date) -> int:
+    """全組分け済みメンバーの現在累積をスナップショット保存。書き込んだ行数を返す。"""
+    iso_date: str = snapshot_date.isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO weekly_snapshots (snapshot_date, discord_id, total_xp, vc_seconds, text_messages)
+        SELECT ?, s.discord_id,
+               COALESCE(t.total_xp, 0),
+               COALESCE(t.vc_seconds, 0),
+               COALESCE(t.text_messages, 0)
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        """,
+        (iso_date,),
+    )
+    written: int = cur.rowcount
+    con.commit()
+    con.close()
+    return written
+
+
+async def post_weekly_digest_for_house(house_id: str) -> str:
+    """指定寮の週次ダイジェストを 該当寮 リーダーボード へ投稿。
+
+    返り値: 結果サマリ文字列（デバッグコマンドが拾って表示）。
+    """
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_id), None)
+    if info is None:
+        return f"unknown house: {house_id}"
+    _, house_name_jp, house_emoji, _ = info
+
+    channel_id: int | None = get_house_channel_id(house_id, "leaderboard")
+    if channel_id is None:
+        return f"no leaderboard channel registered for {house_id}"
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return f"channel {channel_id} not text channel"
+
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    this_monday: datetime.date = _this_jst_monday(now_jst)
+    last_monday: datetime.date = this_monday - datetime.timedelta(days=7)
+    this_sunday: datetime.date = this_monday + datetime.timedelta(days=6)
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    # 寮メンバー + 現在の累積 + 先週のスナップショット
+    cur.execute(
+        """
+        SELECT s.discord_id,
+               COALESCE(t.total_xp,     0) AS total_xp,
+               COALESCE(t.vc_seconds,   0) AS vc_seconds,
+               COALESCE(t.text_messages,0) AS text_messages,
+               COALESCE(ws.total_xp,    0) AS prev_xp,
+               COALESCE(ws.vc_seconds,  0) AS prev_vc,
+               COALESCE(ws.text_messages,0) AS prev_text,
+               (ws.discord_id IS NOT NULL) AS has_prev
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+        WHERE s.house_id = ?
+        """,
+        (last_monday.isoformat(), house_id),
+    )
+    rows: list[tuple[int, int, int, int, int, int, int, int]] = cur.fetchall()
+    con.close()
+
+    if not rows:
+        try:
+            await channel.send(f"今週のダイジェスト: {house_emoji} {house_name_jp} はまだメンバーがいません。")
+        except Exception as e:
+            return f"send failed: {e}"
+        return f"{house_id}: no members"
+
+    has_baseline: bool = any(r[7] for r in rows)
+    members: list[dict[str, Any]] = []
+    for did, total_xp, vc_sec, txt, prev_xp, prev_vc, prev_text, has_prev in rows:
+        gained_xp: int = total_xp - prev_xp if has_prev else 0  # 初回はゼロ表示（先週比なし）
+        gained_vc: int = vc_sec - prev_vc if has_prev else 0
+        gained_text: int = txt - prev_text if has_prev else 0
+        members.append({
+            "discord_id": did,
+            "total_xp": total_xp,
+            "gained_xp": gained_xp,
+            "gained_vc": gained_vc,
+            "gained_text": gained_text,
+            "level": level_from_xp(total_xp),
+        })
+
+    members.sort(key=lambda m: m["gained_xp"], reverse=True)
+
+    house_gained: int = sum(m["gained_xp"] for m in members)
+    active_count: int = sum(1 for m in members if m["gained_xp"] > 0)
+    member_count: int = len(members)
+    total_vc: int = sum(m["gained_vc"] for m in members)
+    total_text: int = sum(m["gained_text"] for m in members)
+
+    # KPIs
+    kpi_lines: list[str] = [
+        f"├ 今週の獲得pt: **+{house_gained:,} pt**",
+        f"├ 参加メンバー: **{active_count}/{member_count}** ({(active_count/max(1,member_count)*100):.1f}%)",
+        f"├ VC在室時間: **{total_vc//3600}h {(total_vc%3600)//60}m**",
+        f"└ テキスト投稿: **{total_text:,}件**",
+    ]
+
+    # トップコントリビューター（上位5）
+    top_lines: list[str] = []
+    for i, m in enumerate(members[:5], start=1):
+        lv: int = m["level"]
+        cur_xp: int = required_xp_for_level(lv)
+        next_xp: int = required_xp_for_level(lv + 1)
+        in_lv: int = m["total_xp"] - cur_xp
+        span: int = max(1, next_xp - cur_xp)
+        share: float = (m["gained_xp"] / house_gained * 100) if house_gained > 0 else 0.0
+        bar: str = _bar10(in_lv / span)
+        top_lines.append(
+            f"<@{m['discord_id']}> **Lv.{lv}** ({in_lv:,}/{span:,} XP)\n"
+            f"{bar} **+{m['gained_xp']:,} pt** ({share:.1f}%)"
+        )
+
+    # 寮間順位算出
+    standings: list[tuple[str, int]] = []
+    con2: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur2: sqlite3.Cursor = con2.cursor()
+    for h in HOUSES:
+        cur2.execute(
+            """
+            SELECT COALESCE(SUM(t.total_xp - COALESCE(ws.total_xp, 0)), 0)
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+            LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+            WHERE s.house_id = ?
+            """,
+            (last_monday.isoformat(), h[0]),
+        )
+        result: tuple[int] = cur2.fetchone()
+        standings.append((h[0], result[0]))
+    con2.close()
+    standings.sort(key=lambda x: x[1], reverse=True)
+    rank: int = next((i for i, (hid, _) in enumerate(standings, start=1) if hid == house_id), 0)
+    rank_line: str = ""
+    if rank == 1 and len(standings) > 1:
+        runner_up_pt: int = standings[1][1]
+        rank_line = f"🏃 順位: **4寮中 1位** / 2位{HOUSE_BY_ID[standings[1][0]][1]}との差 +{house_gained - runner_up_pt:,} pt"
+    elif rank >= 2:
+        leader_pt: int = standings[0][1]
+        rank_line = f"🏃 順位: 4寮中 {rank}位 / 1位{HOUSE_BY_ID[standings[0][0]][1]}まで +{leader_pt - house_gained:,} pt"
+
+    desc: str = "\n".join(kpi_lines)
+    embed: discord.Embed = discord.Embed(
+        title=f"{house_emoji} {house_name_jp} 週次ダイジェスト",
+        description=(
+            f"📅 {this_monday.strftime('%Y年%m月%d日')} 〜 {this_sunday.strftime('%Y年%m月%d日')}\n\n"
+            f"📊 主要指標 (KPIs)\n{desc}"
+        ),
+        color=discord.Color.dark_purple(),
+    )
+    if not has_baseline:
+        embed.add_field(name="📌 注記", value="初回計測（先週比なし）", inline=False)
+    if top_lines:
+        embed.add_field(name="🏆 トップコントリビューター", value="\n\n".join(top_lines)[:1024], inline=False)
+    if rank_line:
+        embed.add_field(name="📈 トレンド", value=rank_line, inline=False)
+    embed.set_footer(text=f"Webダッシュボード: {DASHBOARD_URL}")
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+        )
+    except Exception as e:
+        return f"send failed: {e}"
+    return f"{house_id}: posted ({house_gained:,} pt, {active_count}/{member_count} active)"
+
+
+async def post_weekly_digest_all() -> list[str]:
+    """4寮の週次ダイジェストを投稿し、最後に新スナップショットを保存。"""
+    summaries: list[str] = []
+    for h in HOUSES:
+        summary: str = await post_weekly_digest_for_house(h[0])
+        summaries.append(summary)
+    today: datetime.date = _this_jst_monday()
+    save_weekly_snapshot(today)
+    return summaries
+
+
+async def post_monthly_summary(year_month_override: str | None = None) -> str:
+    """月次サマリを NOTIFICATION_CHANNEL_ID へ投稿。
+
+    year_month_override が None の場合は「先月」を対象（毎月1日0:00発火想定）。
+    """
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if year_month_override is not None:
+        target_ym: str = year_month_override
+    else:
+        prev_month_last_day: datetime.date = now_jst.date().replace(day=1) - datetime.timedelta(days=1)
+        target_ym = prev_month_last_day.strftime("%Y-%m")
+
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return f"NOTIFICATION_CHANNEL_ID {NOTIFICATION_CHANNEL_ID} not text channel"
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+
+    # 寮別合計
+    cur.execute(
+        """
+        SELECT s.house_id, COALESCE(SUM(m.points), 0) AS pt, COUNT(DISTINCT s.discord_id) AS members
+        FROM sorting_hat s
+        LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+        GROUP BY s.house_id
+        """,
+        (target_ym,),
+    )
+    house_rows: list[tuple[str, int, int]] = cur.fetchall()
+    house_rows.sort(key=lambda r: r[1], reverse=True)
+
+    # 個人MVP Top5
+    cur.execute(
+        """
+        SELECT m.discord_id, s.house_id, m.points
+        FROM contribution_monthly m
+        JOIN sorting_hat s ON m.discord_id = s.discord_id
+        WHERE m.year_month = ?
+        ORDER BY m.points DESC
+        LIMIT 5
+        """,
+        (target_ym,),
+    )
+    mvp_rows: list[tuple[int, str, int]] = cur.fetchall()
+    con.close()
+
+    medals: list[str] = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    house_lines: list[str] = []
+    for i, (house_id, pt, members) in enumerate(house_rows):
+        info: tuple[str, str, str, str] = HOUSE_BY_ID[house_id]
+        medal: str = medals[i] if i < len(medals) else f"{i+1}."
+        house_lines.append(f"{medal} {info[2]} {info[1]} — **{pt:,} pt** ({members}人)")
+    mvp_lines: list[str] = []
+    if mvp_rows:
+        for i, (did, hid, pt) in enumerate(mvp_rows, start=1):
+            house_emoji: str = HOUSE_BY_ID[hid][2]
+            mvp_lines.append(f"`#{i}` {house_emoji} <@{did}> — **{pt:,} pt**")
+
+    embed: discord.Embed = discord.Embed(
+        title=f"📅 {target_ym} 月次サマリ",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🏰 寮対抗ランキング",
+        value="\n".join(house_lines) if house_lines else "（記録なし）",
+        inline=False,
+    )
+    embed.add_field(
+        name="🌟 個人MVP Top 5",
+        value="\n".join(mvp_lines) if mvp_lines else "（記録なし）",
+        inline=False,
+    )
+    embed.set_footer(text=f"Webダッシュボード: {DASHBOARD_URL}")
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+        )
+    except Exception as e:
+        return f"send failed: {e}"
+    return f"posted monthly summary for {target_ym}"
+# -----------------------------
+
+
+# --- デバッグ用: ダイジェスト/サマリ手動投稿 ---
+@bot.slash_command(
+    name="debug_post_weekly_digest",
+    description="週次寮ダイジェストを手動投稿します。house 指定なしで全寮。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_post_weekly_digest(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮（省略時は全寮）",
+        choices=["raptor", "krug", "wolf", "gromp", "all"],
+        default="all",
+    ),
+) -> None:
+    await ctx.defer(ephemeral=True)
+    if house == "all":
+        summaries: list[str] = await post_weekly_digest_all()
+        await ctx.respond("✅ 全寮ダイジェスト投稿\n" + "\n".join(f"- {s}" for s in summaries), ephemeral=True)
+    else:
+        summary: str = await post_weekly_digest_for_house(house)
+        await ctx.respond(f"✅ ダイジェスト投稿: {summary}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_post_monthly_summary",
+    description="月次サマリを手動投稿します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_post_monthly_summary(
+    ctx: discord.ApplicationContext,
+    year_month: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象年月 (例: 2026-05)。省略時は先月。",
+        default="",
+    ) = "",
+) -> None:
+    await ctx.defer(ephemeral=True)
+    ym_arg: str | None = year_month if year_month else None
+    result: str = await post_monthly_summary(ym_arg)
+    await ctx.respond(f"✅ {result}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_save_weekly_snapshot",
+    description="今この瞬間の週次スナップショットを保存します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_save_weekly_snapshot(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    today: datetime.date = _this_jst_monday()
+    n: int = save_weekly_snapshot(today)
+    await ctx.respond(f"✅ snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
+
+
 # --- バックグラウンドタスク ---
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=jst))
 async def check_ranks_periodically() -> None:
@@ -1674,6 +2035,30 @@ async def check_ranks_periodically() -> None:
             await channel.send(f"🎉 **ランクアップ！** 🎉\nおめでとうございます、{user_data['member'].mention}さん ({riot_id_full})！\n**{user_data['old_tier']} {user_data['old_rank']}** → **{user_data['new_tier']} {user_data['new_rank']}** に昇格しました！")
 
     print("--- Periodic rank check finished ---")
+
+
+# 週次寮ダイジェスト: 毎日 10:00 JST に発火 → 月曜だけ実投稿
+@tasks.loop(time=datetime.time(hour=10, minute=0, tzinfo=jst))
+async def weekly_digest_task() -> None:
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if now_jst.weekday() != 0:  # 0 = Monday
+        return
+    print(f"--- weekly_digest_task firing on {now_jst.isoformat()} ---")
+    summaries: list[str] = await post_weekly_digest_all()
+    for s in summaries:
+        print(f"  weekly_digest: {s}")
+
+
+# 月次サマリ: 毎日 0:00 JST に発火 → 1日だけ実投稿
+@tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=jst))
+async def monthly_summary_task() -> None:
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if now_jst.day != 1:
+        return
+    print(f"--- monthly_summary_task firing on {now_jst.isoformat()} ---")
+    result: str = await post_monthly_summary()
+    print(f"  monthly_summary: {result}")
+
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
