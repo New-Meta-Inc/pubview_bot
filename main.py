@@ -2,9 +2,11 @@ import os
 import sqlite3
 import datetime
 import time
+import json
 import random
 import string
 from typing import Any
+import aiohttp
 import discord
 from discord.ext import tasks
 from riotwatcher import RiotWatcher, LolWatcher, ApiError
@@ -15,6 +17,9 @@ DISCORD_TOKEN: str | None = os.getenv('DISCORD_TOKEN')
 RIOT_API_KEY: str | None = os.getenv('RIOT_API_KEY')
 DISCORD_GUILD_ID: int = int(os.getenv('DISCORD_GUILD_ID'))
 DB_PATH: str = '/data/lol_bot.db'
+CLOUDFLARE_INGEST_URL: str | None = os.getenv('CLOUDFLARE_INGEST_URL')
+INGEST_TOKEN: str | None = os.getenv('INGEST_TOKEN')
+BOT_VERSION: str = "phase3-2"
 NOTIFICATION_CHANNEL_ID: int = 1401719055643312219 # 通知用チャンネルID
 HONOR_CHANNEL_ID: int = 1447166222591594607 # 名誉用チャンネルID
 VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125
@@ -159,6 +164,15 @@ def setup_database() -> None:
             vc_seconds     INTEGER NOT NULL DEFAULT 0,
             text_messages  INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (snapshot_date, discord_id)
+        )
+    ''')
+    # 寮長: 管理者が手動で任命。D1への同期も同形式
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS house_leaders (
+            house_id   TEXT PRIMARY KEY,
+            discord_id INTEGER NOT NULL,
+            set_at     TEXT NOT NULL,
+            set_by     INTEGER
         )
     ''')
     con.commit()
@@ -881,6 +895,11 @@ async def on_ready() -> None:
         weekly_digest_task.start()
     if not monthly_summary_task.is_running():
         monthly_summary_task.start()
+    if CLOUDFLARE_INGEST_URL and INGEST_TOKEN and not sync_to_d1_task.is_running():
+        sync_to_d1_task.start()
+        print("--- D1 sync task started (5min interval) ---")
+    elif not (CLOUDFLARE_INGEST_URL and INGEST_TOKEN):
+        print("--- D1 sync task SKIPPED: CLOUDFLARE_INGEST_URL / INGEST_TOKEN not set ---")
 
 # --- コマンド ---
 @bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。", guild_ids=[DISCORD_GUILD_ID])
@@ -1386,6 +1405,84 @@ async def setup_house_channels(ctx: discord.ApplicationContext) -> None:
     msg: str = "**寮チャンネルセットアップ完了**\n" + "\n".join(summary_lines)
     await ctx.respond(msg, ephemeral=True)
 
+
+@bot.slash_command(
+    name="set_house_leader",
+    description="指定ユーザーをその寮の寮長に任命します。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def set_house_leader(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮",
+        choices=["raptor", "krug", "wolf", "gromp"],
+    ),
+    user: discord.Member,
+) -> None:
+    """対象ユーザーを寮長に任命。対象は同寮所属のメンバーであることを推奨（ただし制約はかけない）。"""
+    await ctx.defer(ephemeral=True)
+    user_house: str | None = get_user_house_id(user.id)
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house), None)
+    if info is None:
+        await ctx.respond(f"unknown house: {house}", ephemeral=True)
+        return
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO house_leaders (house_id, discord_id, set_at, set_by) VALUES (?, ?, ?, ?)",
+        (house, user.id, now_iso, ctx.author.id),
+    )
+    con.commit()
+    con.close()
+    warn: str = ""
+    if user_house is None:
+        warn = "\n⚠️ 対象ユーザーはまだ組分け帽子を被っていません。"
+    elif user_house != house:
+        warn = f"\n⚠️ 対象ユーザーは別の寮 ({_house_name(user_house)}) に所属しています。"
+    await ctx.respond(
+        f"✅ {info[2]} {info[1]} の寮長に {user.mention} を任命しました。{warn}\n"
+        "次回 D1 同期 (5分以内) でダッシュボードに反映されます。",
+        ephemeral=True,
+    )
+
+
+@bot.slash_command(
+    name="clear_house_leader",
+    description="指定寮の寮長任命を解除します。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def clear_house_leader(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮",
+        choices=["raptor", "krug", "wolf", "gromp"],
+    ),
+) -> None:
+    await ctx.defer(ephemeral=True)
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house), None)
+    if info is None:
+        await ctx.respond(f"unknown house: {house}", ephemeral=True)
+        return
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("DELETE FROM house_leaders WHERE house_id = ?", (house,))
+    changed: int = cur.rowcount
+    con.commit()
+    con.close()
+    if changed == 0:
+        await ctx.respond(f"{info[2]} {info[1]} には寮長が任命されていません。", ephemeral=True)
+    else:
+        await ctx.respond(
+            f"✅ {info[2]} {info[1]} の寮長任命を解除しました。次回 D1 同期で反映されます。",
+            ephemeral=True,
+        )
+
+
 @bot.slash_command(name="add_section", description="参加可能なセクションを登録します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def add_section(ctx: discord.ApplicationContext, section_role: discord.Role, notification_channel: discord.TextChannel) -> None:
@@ -1876,6 +1973,116 @@ async def post_monthly_summary(year_month_override: str | None = None) -> str:
 # -----------------------------
 
 
+# --- Bot → D1 同期 ---
+async def sync_to_d1() -> dict[str, Any]:
+    """Bot SQLite の全テーブルを取得して /api/ingest へ POST する。
+
+    返り値: {ok: bool, status, counts, error?}
+    """
+    if not CLOUDFLARE_INGEST_URL or not INGEST_TOKEN:
+        return {"ok": False, "error": "CLOUDFLARE_INGEST_URL / INGEST_TOKEN unset"}
+
+    guild: discord.Guild | None = bot.get_guild(DISCORD_GUILD_ID)
+    if guild is None:
+        return {"ok": False, "error": f"guild {DISCORD_GUILD_ID} not in cache"}
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+
+    # users: Bot DB の Riot 情報 + Discord プロフィール（display_name/avatar）を結合
+    cur.execute("SELECT discord_id, game_name, tag_line, tier, rank, league_points FROM users")
+    riot_users: dict[int, tuple[str | None, str | None, str | None, str | None, int | None]] = {
+        row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in cur.fetchall()
+    }
+
+    # sorting_hat 配下の discord_id も含めて users 配列に入れる
+    cur.execute("SELECT discord_id FROM sorting_hat")
+    sorted_ids: set[int] = {row[0] for row in cur.fetchall()}
+    all_discord_ids: set[int] = set(riot_users.keys()) | sorted_ids
+    # house_leaders, contribution_totals/monthly に居るが他に無いユーザーもDiscordプロファイル必要
+    cur.execute("SELECT discord_id FROM contribution_totals")
+    for r in cur.fetchall(): all_discord_ids.add(r[0])
+    cur.execute("SELECT discord_id FROM house_leaders")
+    for r in cur.fetchall(): all_discord_ids.add(r[0])
+
+    users_payload: list[dict[str, Any]] = []
+    for did in all_discord_ids:
+        member: discord.Member | None = guild.get_member(did)
+        if member is None:
+            try:
+                member = await guild.fetch_member(did)
+            except Exception:
+                member = None
+        display_name: str = member.display_name if member is not None else f"user_{did}"
+        avatar_url: str | None = str(member.display_avatar.url) if member is not None else None
+        game_name, tag_line, tier, rank_, lp = riot_users.get(did, (None, None, None, None, None))
+        users_payload.append({
+            "discord_id": str(did),
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+            "riot_game_name": game_name,
+            "riot_tag_line": tag_line,
+            "tier": tier,
+            "rank": rank_,
+            "league_points": lp,
+        })
+
+    cur.execute("SELECT discord_id, house_id, rate_bracket, tier, sorted_at FROM sorting_hat")
+    sorting_payload: list[dict[str, Any]] = [
+        {"discord_id": str(r[0]), "house_id": r[1], "rate_bracket": r[2], "tier": r[3], "sorted_at": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT discord_id, total_xp, vc_seconds, text_messages, updated_at FROM contribution_totals")
+    totals_payload: list[dict[str, Any]] = [
+        {"discord_id": str(r[0]), "total_xp": r[1], "vc_seconds": r[2], "text_messages": r[3], "updated_at": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT year_month, discord_id, points, vc_seconds, text_messages FROM contribution_monthly")
+    monthly_payload: list[dict[str, Any]] = [
+        {"year_month": r[0], "discord_id": str(r[1]), "points": r[2], "vc_seconds": r[3], "text_messages": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT house_id, discord_id, set_at, set_by FROM house_leaders")
+    leaders_payload: list[dict[str, Any]] = [
+        {"house_id": r[0], "discord_id": str(r[1]), "set_at": r[2], "set_by": str(r[3]) if r[3] else None}
+        for r in cur.fetchall()
+    ]
+    con.close()
+
+    body: dict[str, Any] = {
+        "bot_version": BOT_VERSION,
+        "users": users_payload,
+        "sorting_hat": sorting_payload,
+        "contribution_totals": totals_payload,
+        "contribution_monthly": monthly_payload,
+        "house_leaders": leaders_payload,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CLOUDFLARE_INGEST_URL,
+                headers={"Authorization": f"Bearer {INGEST_TOKEN}", "Content-Type": "application/json"},
+                data=json.dumps(body),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                status: int = resp.status
+                text: str = await resp.text()
+    except Exception as e:
+        return {"ok": False, "error": f"request failed: {e}"}
+
+    if status != 200:
+        return {"ok": False, "status": status, "error": text[:300]}
+    try:
+        result: dict[str, Any] = json.loads(text)
+    except Exception:
+        result = {"raw": text}
+    return {"ok": True, "status": status, "counts": result.get("counts", {})}
+# -----------------------------
+
+
 # --- デバッグ用: ダイジェスト/サマリ手動投稿 ---
 @bot.slash_command(
     name="debug_post_weekly_digest",
@@ -1932,6 +2139,25 @@ async def debug_save_weekly_snapshot(ctx: discord.ApplicationContext) -> None:
     today: datetime.date = _this_jst_monday()
     n: int = save_weekly_snapshot(today)
     await ctx.respond(f"✅ snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_force_sync",
+    description="Cloudflare D1 への同期を即時実行します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_force_sync(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    result: dict[str, Any] = await sync_to_d1()
+    if result.get("ok"):
+        counts: dict[str, int] = result.get("counts", {})
+        await ctx.respond(
+            f"✅ 同期成功\n```json\n{json.dumps(counts, indent=2, ensure_ascii=False)}\n```",
+            ephemeral=True,
+        )
+    else:
+        await ctx.respond(f"❌ 同期失敗\nstatus={result.get('status')} error={result.get('error')}", ephemeral=True)
 
 
 # --- バックグラウンドタスク ---
@@ -2058,6 +2284,19 @@ async def monthly_summary_task() -> None:
     print(f"--- monthly_summary_task firing on {now_jst.isoformat()} ---")
     result: str = await post_monthly_summary()
     print(f"  monthly_summary: {result}")
+
+
+# Bot → Cloudflare D1: 5分おきに全件同期
+@tasks.loop(minutes=5)
+async def sync_to_d1_task() -> None:
+    if not CLOUDFLARE_INGEST_URL or not INGEST_TOKEN:
+        return  # 環境変数なしのときは何もしない
+    result: dict[str, Any] = await sync_to_d1()
+    if result.get("ok"):
+        counts: dict[str, int] = result.get("counts", {})
+        print(f"--- sync_to_d1 OK: {counts} ---")
+    else:
+        print(f"!!! sync_to_d1 FAILED: status={result.get('status')} error={result.get('error')}")
 
 
 @bot.event
