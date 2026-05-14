@@ -1,0 +1,189 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { HOUSES, houseById, levelFromXp, requiredXpForLevel, USER_LEVEL_COEF, USER_LEVEL_EXP } from '../../lib/houses.ts';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+
+const ym = Astro.params.yyyy_mm ?? '';
+if (!/^\d{4}-\d{2}$/.test(ym)) {
+  return new Response('Invalid year_month (expected YYYY-MM)', { status: 400 });
+}
+
+interface HouseAgg {
+  house_id: string;
+  pt: number;
+  members: number;
+}
+interface UserMonth {
+  discord_id: string;
+  display_name: string;
+  avatar_url: string | null;
+  house_id: string;
+  total_xp: number;
+  points: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+
+let houseAggs: HouseAgg[] = [];
+let topUsers: UserMonth[] = [];
+
+if (env?.DB) {
+  // 寮別合計
+  const r1 = await env.DB.prepare(
+    `SELECT sh.house_id,
+            COALESCE(SUM(m.points), 0) AS pt,
+            COUNT(DISTINCT sh.discord_id) AS members
+     FROM sorting_hat sh
+     LEFT JOIN contribution_monthly m ON sh.discord_id = m.discord_id AND m.year_month = ?
+     GROUP BY sh.house_id
+     ORDER BY pt DESC`,
+  ).bind(ym).all<HouseAgg>();
+  houseAggs = r1.results ?? [];
+  // 4寮全部出すため、欠けてる寮を埋める
+  for (const h of HOUSES) {
+    if (!houseAggs.find((a) => a.house_id === h.id)) {
+      houseAggs.push({ house_id: h.id, pt: 0, members: 0 });
+    }
+  }
+  houseAggs.sort((a, b) => b.pt - a.pt || a.house_id.localeCompare(b.house_id));
+
+  // 個人MVP Top 20
+  const r2 = await env.DB.prepare(
+    `SELECT u.discord_id, u.display_name, u.avatar_url, sh.house_id,
+            COALESCE(ct.total_xp, 0) AS total_xp,
+            m.points AS points,
+            m.vc_seconds AS vc_seconds,
+            m.text_messages AS text_messages
+     FROM contribution_monthly m
+     JOIN users u ON m.discord_id = u.discord_id
+     JOIN sorting_hat sh ON m.discord_id = sh.discord_id
+     LEFT JOIN contribution_totals ct ON m.discord_id = ct.discord_id
+     WHERE m.year_month = ?
+     ORDER BY m.points DESC, ct.total_xp DESC
+     LIMIT 20`,
+  ).bind(ym).all<UserMonth>();
+  topUsers = r2.results ?? [];
+}
+
+function fmt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+function vcHM(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+function userLevelInfo(xp: number) {
+  const level = levelFromXp(xp, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  return { level };
+}
+
+const medals = ['🥇', '🥈', '🥉'];
+const totalHousePt = houseAggs.reduce((s, a) => s + a.pt, 0);
+
+// 前月・翌月リンク
+function shiftMonth(ym: string, delta: number): string {
+  const [yy, mm] = ym.split('-').map(Number);
+  const d = new Date(yy, mm - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+const prevYm = shiftMonth(ym, -1);
+const nextYm = shiftMonth(ym, +1);
+const currentYm = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 7);
+const isFutureMonth = ym > currentYm;
+---
+<Layout title={`${ym} 月次アーカイブ | ぱぶびゅ！ダッシュボード`}>
+  <main class="mx-auto max-w-4xl px-4 py-10 sm:px-6 sm:py-14">
+    <nav class="mb-6 flex items-center justify-between text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-200">← 寮対抗ボードへ戻る</a>
+      <div class="flex items-center gap-2 text-xs">
+        <a href={`/monthly/${prevYm}`} class="rounded bg-slate-800 px-2 py-1 text-slate-300 hover:bg-slate-700">← {prevYm}</a>
+        {!isFutureMonth && (
+          <a href={`/monthly/${nextYm}`} class="rounded bg-slate-800 px-2 py-1 text-slate-300 hover:bg-slate-700">{nextYm} →</a>
+        )}
+      </div>
+    </nav>
+
+    <header>
+      <p class="text-xs uppercase tracking-[0.3em] text-slate-500">pubview / monthly archive</p>
+      <h1 class="text-3xl font-black tracking-tight sm:text-4xl">📅 {ym} 月次アーカイブ</h1>
+      {ym === currentYm && <p class="mt-1 text-xs text-slate-400">（進行中の今月）</p>}
+    </header>
+
+    <section class="mt-8">
+      <h2 class="text-lg font-bold">🏰 寮対抗ランキング</h2>
+      <ol class="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {houseAggs.map((agg, i) => {
+          const h = houseById(agg.house_id);
+          if (!h) return null;
+          const medal = medals[i] ?? `${i + 1}.`;
+          const share = totalHousePt > 0 ? (agg.pt / totalHousePt * 100) : 0;
+          return (
+            <a href={`/houses/${agg.house_id}`} class={`block rounded-2xl ${h.themeBg} p-4 ring-1 ${h.themeRing} hover:ring-2`}>
+              <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                  <span class="text-2xl">{medal}</span>
+                  <div>
+                    <div class="text-3xl leading-none">{h.emoji}</div>
+                    <div class={`mt-1 text-lg font-bold ${h.themeAccent}`}>{h.name}</div>
+                  </div>
+                </div>
+                <div class="text-right">
+                  <div class="text-xs text-slate-300">月次pt</div>
+                  <div class="text-2xl font-black tabular-nums">{fmt(agg.pt)}</div>
+                  <div class="mt-0.5 text-[10px] text-slate-400">{agg.members}人 ・ {share.toFixed(1)}%</div>
+                </div>
+              </div>
+            </a>
+          );
+        })}
+      </ol>
+    </section>
+
+    <section class="mt-10 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+      <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-bold">🌟 個人MVP（{ym} の月次pt順）</h2>
+        <p class="text-xs text-slate-500">Top {topUsers.length}</p>
+      </div>
+      {topUsers.length === 0 ? (
+        <p class="mt-6 text-sm text-slate-500">この月の記録はありません。</p>
+      ) : (
+        <ol class="mt-4 divide-y divide-slate-800">
+          {topUsers.map((m, i) => {
+            const h = houseById(m.house_id);
+            const lv = userLevelInfo(m.total_xp);
+            return (
+              <li class="flex items-center gap-3 py-3 text-sm">
+                <span class="w-10 text-right font-mono text-slate-500 tabular-nums">#{i + 1}</span>
+                <img
+                  src={m.avatar_url ?? '/favicon.svg'}
+                  alt=""
+                  loading="lazy"
+                  class="h-8 w-8 shrink-0 rounded-full bg-slate-800 object-cover"
+                />
+                <a href={`/houses/${m.house_id}`} class={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-base ${h?.themeBg ?? 'bg-slate-800'} ${h?.themeRing ?? 'ring-slate-700'} ring-1 hover:ring-2`} title={h?.name ?? ''}>
+                  {h?.emoji ?? '?'}
+                </a>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <a href={`/u/${encodeURIComponent(m.display_name)}`} class="truncate font-medium hover:underline">{m.display_name}</a>
+                    <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-100 ${h?.themeBar ?? 'bg-slate-700'}`}>Lv {lv.level}</span>
+                  </div>
+                  <div class="mt-0.5 text-[10px] text-slate-500 tabular-nums">VC {vcHM(m.vc_seconds)} ・ {fmt(m.text_messages)}件</div>
+                </div>
+                <span class="shrink-0 font-mono text-slate-300 tabular-nums">{fmt(m.points)} pt</span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+
+    <footer class="mt-10 border-t border-slate-800 pt-6 text-xs text-slate-500">
+      <a href="/leaderboard" class="hover:text-slate-300">全体ランキング →</a>
+    </footer>
+  </main>
+</Layout>

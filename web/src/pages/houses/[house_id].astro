@@ -1,0 +1,218 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import {
+  HOUSES,
+  houseById,
+  levelFromXp,
+  requiredXpForLevel,
+  HOUSE_LEVEL_COEF,
+  HOUSE_LEVEL_EXP,
+  USER_LEVEL_COEF,
+  USER_LEVEL_EXP,
+} from '../../lib/houses.ts';
+
+export const prerender = false;
+
+const houseId = Astro.params.house_id;
+const houseDef = houseById(houseId ?? '');
+if (!houseDef) {
+  return new Response('House not found', { status: 404 });
+}
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+const currentYm = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 7);
+
+interface MemberRow {
+  discord_id: string;
+  display_name: string;
+  avatar_url: string | null;
+  total_xp: number;
+  vc_seconds: number;
+  text_messages: number;
+  month_pt: number;
+}
+interface HouseStats {
+  member_count: number;
+  total_xp: number;
+  monthly_points: number;
+}
+
+let stats: HouseStats = { member_count: 0, total_xp: 0, monthly_points: 0 };
+let members: MemberRow[] = [];
+let leaderName: string | null = null;
+
+if (env?.DB) {
+  const statsRow = await env.DB.prepare(
+    `SELECT COUNT(DISTINCT sh.discord_id) AS member_count,
+            COALESCE(SUM(ct.total_xp), 0)  AS total_xp,
+            COALESCE(SUM(cm.points), 0)    AS monthly_points
+     FROM sorting_hat sh
+     LEFT JOIN contribution_totals ct ON sh.discord_id = ct.discord_id
+     LEFT JOIN contribution_monthly cm ON sh.discord_id = cm.discord_id AND cm.year_month = ?
+     WHERE sh.house_id = ?`,
+  ).bind(currentYm, houseId).first<HouseStats>();
+  if (statsRow) stats = statsRow;
+
+  const membersResult = await env.DB.prepare(
+    `SELECT u.discord_id, u.display_name, u.avatar_url,
+            COALESCE(ct.total_xp, 0)      AS total_xp,
+            COALESCE(ct.vc_seconds, 0)    AS vc_seconds,
+            COALESCE(ct.text_messages, 0) AS text_messages,
+            COALESCE(cm.points, 0)        AS month_pt
+     FROM sorting_hat sh
+     JOIN users u ON sh.discord_id = u.discord_id
+     LEFT JOIN contribution_totals  ct ON sh.discord_id = ct.discord_id
+     LEFT JOIN contribution_monthly cm ON sh.discord_id = cm.discord_id AND cm.year_month = ?
+     WHERE sh.house_id = ?
+     ORDER BY total_xp DESC`,
+  ).bind(currentYm, houseId).all<MemberRow>();
+  members = membersResult.results ?? [];
+
+  const leaderRow = await env.DB.prepare(
+    `SELECT u.display_name
+     FROM house_leaders hl
+     JOIN users u ON hl.discord_id = u.discord_id
+     WHERE hl.house_id = ?`,
+  ).bind(houseId).first<{ display_name: string }>();
+  leaderName = leaderRow?.display_name ?? null;
+}
+
+const houseLv = levelFromXp(stats.total_xp, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+const houseCurXp = requiredXpForLevel(houseLv, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+const houseNextXp = requiredXpForLevel(houseLv + 1, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+const houseProgress = houseNextXp > houseCurXp
+  ? Math.min(100, Math.max(0, ((stats.total_xp - houseCurXp) / (houseNextXp - houseCurXp)) * 100))
+  : 0;
+
+function fmt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+function vcHM(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+function userLevelInfo(xp: number) {
+  const level = levelFromXp(xp, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const curXp = requiredXpForLevel(level, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const nextXp = requiredXpForLevel(level + 1, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const inLv = xp - curXp;
+  const span = Math.max(1, nextXp - curXp);
+  const progress = Math.min(100, Math.max(0, (inLv / span) * 100));
+  return { level, inLv, span, progress };
+}
+---
+<Layout title={`${houseDef.name} | ぱぶびゅ！ダッシュボード`}>
+  <main class="mx-auto max-w-5xl px-4 py-10 sm:px-6 sm:py-14">
+    <nav class="mb-6 text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-200">← 寮対抗ボードへ戻る</a>
+    </nav>
+
+    <header class={`rounded-2xl ${houseDef.themeBg} p-6 ring-1 ${houseDef.themeRing} sm:p-8`}>
+      <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <div class="text-6xl leading-none">{houseDef.emoji}</div>
+          <h1 class={`mt-3 text-3xl font-black tracking-tight sm:text-4xl ${houseDef.themeAccent}`}>{houseDef.name}</h1>
+          <p class="mt-1 text-sm text-slate-300">
+            寮長: {leaderName ? <span class="font-semibold text-slate-100">{leaderName}</span> : <span class="text-slate-500">未任命</span>}
+          </p>
+        </div>
+        <div class="text-right">
+          <div class="text-xs text-slate-300">寮Lv</div>
+          <div class="text-5xl font-black tabular-nums">{houseLv}</div>
+        </div>
+      </div>
+
+      <div class="mt-5">
+        <div class="flex items-baseline justify-between text-xs text-slate-200">
+          <span>{fmt(stats.total_xp - houseCurXp)} / {fmt(houseNextXp - houseCurXp)} XP</span>
+          <span>次Lvまで</span>
+        </div>
+        <div class="mt-1 h-2.5 overflow-hidden rounded-full bg-slate-900/70">
+          <div class={`h-full ${houseDef.themeBar}`} style={`width: ${houseProgress}%`}></div>
+        </div>
+      </div>
+    </header>
+
+    <section class="mt-8 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">累積XP</div>
+        <div class="mt-1 text-2xl font-bold tabular-nums">{fmt(stats.total_xp)}</div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">今月pt</div>
+        <div class="mt-1 text-2xl font-bold tabular-nums">{fmt(stats.monthly_points)}</div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">メンバー</div>
+        <div class="mt-1 text-2xl font-bold tabular-nums">{stats.member_count}<span class="ml-0.5 text-base font-normal">人</span></div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">寮Lv</div>
+        <div class={`mt-1 text-2xl font-bold tabular-nums ${houseDef.themeAccent}`}>Lv {houseLv}</div>
+      </div>
+    </section>
+
+    <section class="mt-8 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+      <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-bold">メンバー（累積XP順）</h2>
+        <p class="text-xs text-slate-500">{members.length} 名</p>
+      </div>
+
+      {members.length === 0 ? (
+        <p class="mt-6 text-sm text-slate-500">まだメンバーがいません。</p>
+      ) : (
+        <ol class="mt-4 divide-y divide-slate-800">
+          {members.map((m, i) => {
+            const lv = userLevelInfo(m.total_xp);
+            return (
+              <li class="flex items-center gap-3 py-3 text-sm">
+                <span class="w-8 text-right font-mono text-slate-500 tabular-nums">#{i + 1}</span>
+                <img
+                  src={m.avatar_url ?? '/favicon.svg'}
+                  alt=""
+                  loading="lazy"
+                  class="h-8 w-8 shrink-0 rounded-full bg-slate-800 object-cover"
+                />
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <a href={`/u/${encodeURIComponent(m.display_name)}`} class="truncate font-medium hover:underline">{m.display_name}</a>
+                    <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-100 ${houseDef.themeBar}`}>Lv {lv.level}</span>
+                  </div>
+                  <div class="mt-1 flex items-center gap-2">
+                    <div class="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-800">
+                      <div class={`h-full ${houseDef.themeBar}`} style={`width: ${lv.progress}%`}></div>
+                    </div>
+                    <span class="shrink-0 font-mono text-[10px] text-slate-500 tabular-nums">
+                      {fmt(lv.inLv)}/{fmt(lv.span)} XP
+                    </span>
+                  </div>
+                </div>
+                <div class="shrink-0 text-right">
+                  <div class="font-mono text-slate-200 tabular-nums">{fmt(m.month_pt)} pt</div>
+                  <div class="text-[10px] text-slate-500 tabular-nums">VC {vcHM(m.vc_seconds)} ・ {fmt(m.text_messages)}件</div>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+
+    <footer class="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-slate-800 pt-6 text-xs text-slate-500">
+      <span>4寮:
+        {HOUSES.map((h, i) => (
+          <>
+            {i > 0 && ' / '}
+            {h.id === houseId ? (
+              <span class={`font-semibold ${h.themeAccent}`}>{h.emoji} {h.name}</span>
+            ) : (
+              <a href={`/houses/${h.id}`} class="hover:text-slate-300">{h.emoji} {h.name}</a>
+            )}
+          </>
+        ))}
+      </span>
+      <a href="/" class="hover:text-slate-300">トップへ →</a>
+    </footer>
+  </main>
+</Layout>

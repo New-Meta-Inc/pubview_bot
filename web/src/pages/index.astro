@@ -136,8 +136,9 @@ function userLevelInfo(xp: number) {
         const progress = nextXp > curXp ? Math.min(100, Math.max(0, ((s.total_xp - curXp) / (nextXp - curXp)) * 100)) : 0;
         const tops = topByHouse[h.id] ?? [];
         return (
-          <article class={`rounded-2xl ${h.themeBg} p-5 ring-1 ${h.themeRing}`}>
-            <div class="flex items-start justify-between">
+          <article class={`group relative rounded-2xl ${h.themeBg} p-5 ring-1 ${h.themeRing} transition hover:ring-2`}>
+            <a href={`/houses/${h.id}`} class="absolute inset-0 z-0 rounded-2xl" aria-label={`${h.name} の詳細`}></a>
+            <div class="relative z-10 flex items-start justify-between">
               <div>
                 <div class="text-4xl leading-none">{h.emoji}</div>
                 <h2 class={`mt-2 text-lg font-bold ${h.themeAccent}`}>{h.name}</h2>
@@ -181,10 +182,10 @@ function userLevelInfo(xp: number) {
                   {tops.map((m, i) => {
                     const lv = userLevelInfo(m.total_xp);
                     return (
-                      <li class="flex items-baseline justify-between gap-3">
+                      <li class="relative flex items-baseline justify-between gap-3">
                         <span class="truncate">
                           <span class="mr-1 text-slate-500 tabular-nums">{i + 1}.</span>
-                          {m.display_name}
+                          <a href={`/u/${encodeURIComponent(m.display_name)}`} class="relative z-10 hover:underline">{m.display_name}</a>
                           <span class="ml-1.5 rounded bg-slate-800/80 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-200">Lv {lv.level}</span>
                         </span>
                         <span class="font-mono text-xs text-slate-300 tabular-nums">{fmt(m.points)}</span>
@@ -220,7 +221,7 @@ function userLevelInfo(xp: number) {
                 </span>
                 <div class="min-w-0 flex-1">
                   <div class="flex items-center gap-2">
-                    <span class="truncate font-medium">{m.display_name}</span>
+                    <a href={`/u/${encodeURIComponent(m.display_name)}`} class="truncate font-medium hover:underline">{m.display_name}</a>
                     <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-100 ${h?.themeBar ?? 'bg-slate-700'}`}>Lv {lv.level}</span>
                   </div>
                   <div class="mt-1 flex items-center gap-2">
@@ -238,8 +239,16 @@ function userLevelInfo(xp: number) {
       </ol>
     </section>
 
-    <footer class="mt-12 border-t border-slate-800 pt-6 text-xs text-slate-500">
-      <p>個別の寮詳細・累積ランキング・個人ページは順次追加します（Phase 3）。</p>
+    <footer class="mt-12 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-6 text-xs text-slate-500">
+      <div class="flex flex-wrap gap-3">
+        <a href="/leaderboard" class="hover:text-slate-200">🏆 全体ランキング</a>
+        <a href={`/monthly/${currentYm}`} class="hover:text-slate-200">📅 月次アーカイブ</a>
+      </div>
+      <div class="flex flex-wrap gap-3 text-slate-500">
+        {HOUSES.map((h) => (
+          <a href={`/houses/${h.id}`} class="hover:text-slate-200">{h.emoji} {h.name}</a>
+        ))}
+      </div>
     </footer>
   </main>
 </Layout>
