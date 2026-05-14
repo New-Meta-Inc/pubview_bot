@@ -25,6 +25,38 @@ RANK_ROLES: dict[str, str] = {
     "DIAMOND": "LoL Diamond(Solo/Duo)", "MASTER": "LoL Master(Solo/Duo)",
     "GRANDMASTER": "LoL Grandmaster(Solo/Duo)", "CHALLENGER": "LoL Challenger(Solo/Duo)"
 }
+
+# --- 組分け帽子機能の設定 ---
+# 組（ハウス）定義: (内部ID, 表示名, 絵文字, ロール名)
+HOUSES: list[tuple[str, str, str, str]] = [
+    ("gryffindor", "グリフィンドール", "🦁", "グリフィンドール"),
+    ("slytherin", "スリザリン", "🐍", "スリザリン"),
+    ("ravenclaw", "レイヴンクロー", "🦅", "レイヴンクロー"),
+    ("hufflepuff", "ハッフルパフ", "🦡", "ハッフルパフ"),
+]
+
+# プルダウン用のTier一覧（最高レート選択肢）
+SORTING_TIERS: list[tuple[str, str]] = [
+    ("UNRANKED", "Unranked"),
+    ("IRON", "Iron"),
+    ("BRONZE", "Bronze"),
+    ("SILVER", "Silver"),
+    ("GOLD", "Gold"),
+    ("PLATINUM", "Platinum"),
+    ("EMERALD", "Emerald"),
+    ("DIAMOND", "Diamond"),
+    ("MASTER", "Master"),
+    ("GRANDMASTER", "Grandmaster"),
+    ("CHALLENGER", "Challenger"),
+]
+
+# Tier → レート帯
+RATE_BRACKET_OF_TIER: dict[str, str] = {
+    "UNRANKED": "low", "IRON": "low", "BRONZE": "low", "SILVER": "low",
+    "GOLD": "mid", "PLATINUM": "mid",
+    "EMERALD": "high", "DIAMOND": "high",
+    "MASTER": "apex", "GRANDMASTER": "apex", "CHALLENGER": "apex",
+}
 # ----------------
 
 # --- データベースの初期設定 ---
@@ -50,6 +82,16 @@ def setup_database() -> None:
             notification_channel_id INTEGER NOT NULL
         )
     ''')
+    # 組分け帽子: ユーザーごとに所属組とその時のレート帯を記録
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS sorting_hat (
+            discord_id INTEGER PRIMARY KEY,
+            house_id TEXT NOT NULL,
+            rate_bracket TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            sorted_at TEXT NOT NULL
+        )
+    ''')
     con.commit()
     con.close()
 # -----------------------------
@@ -70,10 +112,6 @@ my_region_for_summoner: str = 'jp1'
 class DashboardView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
-
-    @discord.ui.button(label="名誉を贈る", style=discord.ButtonStyle.primary, custom_id="dashboard:give_honor")
-    async def give_honor_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(GiveHonorModal())
 
     @discord.ui.button(label="Riot IDの登録", style=discord.ButtonStyle.success, custom_id="dashboard:register")
     async def register_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
@@ -105,52 +143,135 @@ class DashboardView(discord.ui.View):
             print(f"!!! An unexpected error occurred in 'unregister_button': {e}")
             await interaction.followup.send("登録解除中に予期せぬエラーが発生しました。", ephemeral=True, delete_after=30.0)
 
-    @discord.ui.button(label="セクションに参加", style=discord.ButtonStyle.primary, custom_id="dashboard:join_section")
-    async def get_section_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
-        guild: discord.Guild | None = interaction.guild
-        if not guild:
-            return
+    @discord.ui.button(label="🎩 組分け帽子を被る", style=discord.ButtonStyle.primary, custom_id="dashboard:sorting_hat")
+    async def sorting_hat_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        # 既に組分け済みかチェック
         con: sqlite3.Connection = sqlite3.connect(DB_PATH)
         cur: sqlite3.Cursor = con.cursor()
-        cur.execute("SELECT role_id, section_name FROM sections")
-        all_sections: list[tuple[int, str]] = cur.fetchall()
+        cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (interaction.user.id,))
+        existing: tuple[str] | None = cur.fetchone()
         con.close()
 
-        available_sections: list[tuple[int, str]] = []
-        for role_id, section_name in all_sections:
-            role: discord.Role | None = guild.get_role(role_id)
-            if role and len(role.members) <35:
-                available_sections.append((role_id, section_name))
-
-        if not available_sections:
-            await interaction.response.send_message("現在参加可能なセクションはありません。", ephemeral=True, delete_after=60)
-            return
-
-        await interaction.response.send_message(content="参加したいセクションを選択してください。", view=SectionSelectView(available_sections), ephemeral=True, delete_after=180)
-
-    @discord.ui.button(label="セクションから退出", style=discord.ButtonStyle.secondary, custom_id="dashboard:leave_section", disabled=False)
-    async def remove_section_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
-        member: discord.Member | discord.User = interaction.user
-        if not isinstance(member, discord.Member):
-            return
-        con: sqlite3.Connection = sqlite3.connect(DB_PATH)
-        cur: sqlite3.Cursor = con.cursor()
-        cur.execute("SELECT role_id FROM sections")
-        managed_role_ids: set[int] = {row[0] for row in cur.fetchall()}
-        con.close()
-
-        user_managed_roles: list[discord.Role] = [role for role in member.roles if role.id in managed_role_ids]
-
-        if not user_managed_roles:
-            await interaction.response.send_message("退出可能なセクションがありません。", ephemeral=True, delete_after=60)
-            return
+        if existing:
+            existing_house_id: str = existing[0]
+            house_info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == existing_house_id), None)
+            if house_info:
+                await interaction.response.send_message(
+                    f"あなたは既に **{house_info[2]} {house_info[1]}** に組分け済みです。再組分けは現在サポートされていません。",
+                    ephemeral=True,
+                    delete_after=30.0,
+                )
+                return
 
         await interaction.response.send_message(
-            content="退出したいセクションを選択してください。",
-            view=RemoveSectionView(user_managed_roles),
+            content="🎩 帽子があなたの最高レートを尋ねています…\nプルダウンから最高到達Tierを選んでください。",
+            view=SortingHatTierSelectView(),
             ephemeral=True,
-            delete_after=180
+            delete_after=180,
         )
+
+# --- 組分け帽子: UI と振り分けロジック ---
+class SortingHatTierSelectView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=180)
+        self.add_item(SortingHatTierSelect())
+
+
+class SortingHatTierSelect(discord.ui.Select):
+    def __init__(self) -> None:
+        options: list[discord.SelectOption] = [
+            discord.SelectOption(label=label, value=tier_id) for tier_id, label in SORTING_TIERS
+        ]
+        super().__init__(
+            placeholder="最高到達Tierを選択してください",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="sorting_hat:tier_select",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        selected_tier: str = self.values[0]
+        bracket: str = RATE_BRACKET_OF_TIER[selected_tier]
+        user: discord.User | discord.Member = interaction.user
+        guild: discord.Guild | None = interaction.guild
+        if not guild:
+            await interaction.followup.send("ギルド情報が取得できませんでした。", ephemeral=True, delete_after=30.0)
+            return
+
+        # 二重組分け防止（プルダウン操作中に他で組分けが完了した場合のレース対策）
+        con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+        cur: sqlite3.Cursor = con.cursor()
+        cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (user.id,))
+        if cur.fetchone():
+            con.close()
+            await interaction.followup.send("既に組分け済みです。", ephemeral=True, delete_after=30.0)
+            return
+
+        # 対象レート帯における各組の現在人数をカウント
+        cur.execute(
+            "SELECT house_id, COUNT(*) FROM sorting_hat WHERE rate_bracket = ? GROUP BY house_id",
+            (bracket,),
+        )
+        counts: dict[str, int] = {row[0]: row[1] for row in cur.fetchall()}
+
+        # 最少人数の組を選ぶ（同数はランダム）
+        house_ids: list[str] = [h[0] for h in HOUSES]
+        min_count: int = min(counts.get(hid, 0) for hid in house_ids)
+        candidates: list[str] = [hid for hid in house_ids if counts.get(hid, 0) == min_count]
+        chosen_house_id: str = random.choice(candidates)
+
+        # DB保存
+        sorted_at: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        cur.execute(
+            "INSERT INTO sorting_hat (discord_id, house_id, rate_bracket, tier, sorted_at) VALUES (?, ?, ?, ?, ?)",
+            (user.id, chosen_house_id, bracket, selected_tier, sorted_at),
+        )
+        con.commit()
+        con.close()
+
+        # 組情報取得
+        house_info: tuple[str, str, str, str] = next(h for h in HOUSES if h[0] == chosen_house_id)
+        _, house_name_jp, house_emoji, role_name = house_info
+
+        # ロール付与
+        member: discord.Member | None = guild.get_member(user.id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user.id)
+            except Exception as e:
+                print(f"!!! sorting_hat: failed to fetch member: {e}")
+        if member is not None:
+            role: discord.Role | None = discord.utils.get(guild.roles, name=role_name)
+            if role is not None:
+                try:
+                    await member.add_roles(role, reason="組分け帽子による組分け")
+                except Exception as e:
+                    print(f"!!! sorting_hat: failed to add role '{role_name}': {e}")
+            else:
+                print(f"!!! sorting_hat: role '{role_name}' not found in guild")
+
+        # 本人へのephemeral返答
+        await interaction.followup.send(
+            f"🎩 帽子はあなたを **{house_emoji} {house_name_jp}** に振り分けました！",
+            ephemeral=True,
+            delete_after=30.0,
+        )
+
+        # グローバルメッセージ投稿
+        channel: discord.abc.Messageable | None = interaction.channel
+        if channel is not None:
+            embed: discord.Embed = discord.Embed(
+                title="🎩 組分け帽子",
+                description=f"{user.mention} は **{house_emoji} {house_name_jp}** に組分けされました！",
+                color=discord.Color.purple(),
+            )
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                print(f"!!! sorting_hat: failed to send global message: {e}")
+
 
 class GiveHonorModal(discord.ui.Modal):
     def __init__(self) -> None:
@@ -587,16 +708,14 @@ async def dashboard(ctx: discord.ApplicationContext, channel: discord.TextChanne
     embed: discord.Embed = discord.Embed(
         title="# ダッシュボード", # 絵文字は適当なものに置き換えてください
         description=(
-            "## 名誉を贈る\n"
-            "名誉を贈りたいユーザーと理由を入力してください。\n"
             "## Riot IDの登録\n"
             "あなたのRiot IDをサーバーに登録しましょう！\n"
             f"このボタンからあなたのRiot IDを登録すると、あなたのSolo/Duoランクが24時間ごとに自動でチェックされ、サーバー内のラダーランキング(<#{NOTIFICATION_CHANNEL_ID}>)に反映されます。\n"
             "## Riot IDの登録解除\n"
             "ボットからあなたのRiot ID情報を削除します。\n"
-            "## セクションに参加\n"
-            "セクションのテキスト、ボイスチャンネルに参加します。\n"
-            "セクションの人数上限は35名です。\n"
+            "## 🎩 組分け帽子を被る\n"
+            "あなたの最高到達Tierを申告すると、4つの組のいずれかに振り分けられ、対応するロールが付与されます。\n"
+            "各レート帯ごとに人数が均等になるよう自動で振り分けられます。\n"
         ),
         color=discord.Color.blue()
     )
