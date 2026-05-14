@@ -584,13 +584,13 @@ async def on_ready() -> None:
 
     # Bot起動時に永続Viewを登録
     bot.add_view(DashboardView())
-    # ▼▼▼ 起動時にランキングを投稿する処理を追加 ▼▼▼
-    print("--- Posting initial ranking on startup ---")
-    channel: discord.TextChannel | discord.VoiceChannel | discord.Thread | None = bot.get_channel(NOTIFICATION_CHANNEL_ID)
-    if channel:
-        ranking_embed: discord.Embed = await create_ranking_embed()
-        if ranking_embed:
-            await channel.send("【起動時ランキング速報】", embed=ranking_embed)
+    # 起動時ランキング速報は一旦停止（再開する場合は下記ブロックを有効化）
+    # print("--- Posting initial ranking on startup ---")
+    # channel: discord.TextChannel | discord.VoiceChannel | discord.Thread | None = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    # if channel:
+    #     ranking_embed: discord.Embed = await create_ranking_embed()
+    #     if ranking_embed:
+    #         await channel.send("【起動時ランキング速報】", embed=ranking_embed)
 
     if not check_ranks_periodically.is_running():
         check_ranks_periodically.start()
