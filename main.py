@@ -185,14 +185,22 @@ def level_from_xp(xp: int, coef: int = CONTRIBUTION_USER_LEVEL_COEF, exp: float 
     return max(1, int(raw_level))
 
 
-def add_contribution(discord_id: int, xp: int, vc_seconds: int, text_messages: int, last_text_at_iso: str | None = None) -> None:
-    """totals と monthly に同時加算。組分け済みであることは呼び出し側で保証する。"""
+def add_contribution(discord_id: int, xp: int, vc_seconds: int, text_messages: int, last_text_at_iso: str | None = None) -> tuple[int, int]:
+    """totals と monthly に同時加算。組分け済みであることは呼び出し側で保証する。
+
+    返り値: (old_level, new_level) - 加算前後の個人レベル。Lvアップ判定に使う。
+    """
     if xp == 0 and vc_seconds == 0 and text_messages == 0:
-        return
+        return (0, 0)
     now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
     ym: str = current_year_month_jst()
     con: sqlite3.Connection = sqlite3.connect(DB_PATH)
     cur: sqlite3.Cursor = con.cursor()
+    # 加算前の累積XPを取得（Lvアップ判定用）
+    cur.execute("SELECT total_xp FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[int] | None = cur.fetchone()
+    old_xp: int = row[0] if row else 0
+    old_level: int = level_from_xp(old_xp)
     # totals
     cur.execute(
         """
@@ -221,6 +229,86 @@ def add_contribution(discord_id: int, xp: int, vc_seconds: int, text_messages: i
     )
     con.commit()
     con.close()
+    new_level: int = level_from_xp(old_xp + xp)
+    return (old_level, new_level)
+
+
+def get_user_house_id(discord_id: int) -> str | None:
+    """sorting_hat から所属寮IDを取得"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def get_house_channel_id(house_id: str, channel_type: str) -> int | None:
+    """house_channels から指定寮・チャンネル種別のIDを取得"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "SELECT channel_id FROM house_channels WHERE house_id = ? AND channel_type = ?",
+        (house_id, channel_type),
+    )
+    row: tuple[int] | None = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+async def notify_level_up(discord_id: int, old_level: int, new_level: int) -> None:
+    """所属寮の リーダーボード チャンネルに Lvアップ祝福を投稿する。
+    1Lv上昇でも 2Lv以上上昇でも一回だけ最終Lvを祝う（連続Lvアップは合算表現）。
+    """
+    if new_level <= old_level:
+        return
+    house_id: str | None = get_user_house_id(discord_id)
+    if house_id is None:
+        return
+    channel_id: int | None = get_house_channel_id(house_id, "leaderboard")
+    if channel_id is None:
+        return
+    channel: discord.abc.GuildChannel | None = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    house_info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_id), None)
+    house_emoji: str = house_info[2] if house_info else "🏰"
+    house_name_jp: str = house_info[1] if house_info else "?"
+
+    # 次Lvまでの必要XP
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT total_xp FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[int] | None = cur.fetchone()
+    con.close()
+    total_xp: int = row[0] if row else 0
+    next_required: int = required_xp_for_level(new_level + 1)
+    cur_required: int = required_xp_for_level(new_level)
+    remaining: int = max(0, next_required - total_xp)
+    in_lv: int = max(0, total_xp - cur_required)
+    span: int = max(1, next_required - cur_required)
+
+    title: str = "🎉 Lv UP!"
+    if new_level - old_level >= 2:
+        title = f"🎉🎉 {new_level - old_level}連Lv UP!"
+
+    embed: discord.Embed = discord.Embed(
+        title=title,
+        description=f"<@{discord_id}> さんが **Lv {new_level}** に到達しました！",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="所属", value=f"{house_emoji} {house_name_jp}", inline=True)
+    embed.add_field(name="現在", value=f"Lv {new_level}", inline=True)
+    embed.add_field(name=f"次Lv {new_level + 1} まで", value=f"あと **{remaining:,} XP**（{in_lv:,}/{span:,}）", inline=False)
+    embed.set_footer(text="Webダッシュボード: https://pubview-dashboard.pages.dev/")
+    try:
+        await channel.send(
+            embed=embed,
+            # 個人メンションは embed の description 内に <@id> として含めて発火させる
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=discord_id)]),
+        )
+    except Exception as e:
+        print(f"!!! notify_level_up: failed to send to channel {channel_id}: {e}")
 
 
 def vc_session_start(discord_id: int, channel_id: int) -> None:
@@ -236,32 +324,35 @@ def vc_session_start(discord_id: int, channel_id: int) -> None:
     con.close()
 
 
-def vc_session_end(discord_id: int) -> int:
-    """VC退出時に在室秒数を確定し、totals/monthly へ加算。在室秒数を返す。"""
+def vc_session_end(discord_id: int) -> tuple[int, int]:
+    """VC退出時に在室秒数を確定し、totals/monthly へ加算。
+
+    返り値: (old_level, new_level) - Lvアップ判定用。何も加算されなかった場合は (0, 0)。
+    """
     con: sqlite3.Connection = sqlite3.connect(DB_PATH)
     cur: sqlite3.Cursor = con.cursor()
     cur.execute("SELECT joined_at FROM vc_sessions WHERE discord_id = ?", (discord_id,))
     row: tuple[str] | None = cur.fetchone()
     if not row:
         con.close()
-        return 0
+        return (0, 0)
     try:
         joined_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
     except ValueError:
         cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
         con.commit()
         con.close()
-        return 0
+        return (0, 0)
     now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
     seconds: int = max(0, int((now_utc - joined_at).total_seconds()))
     cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
     con.commit()
     con.close()
-    if seconds > 0:
-        # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
-        added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
-        add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
-    return seconds
+    if seconds <= 0:
+        return (0, 0)
+    # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
+    added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
+    return add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
 # -----------------------------
 
 # --- Botの初期設定 ---
@@ -1346,6 +1437,58 @@ async def remove_user_from_section(ctx: discord.ApplicationContext, user: discor
 
 
 # --- デバッグ用コマンド ---
+@bot.slash_command(
+    name="setup_dev_channel",
+    description="開発者用のテストチャンネルを作成します（実行者と Bot のみ閲覧可）。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def setup_dev_channel(
+    ctx: discord.ApplicationContext,
+    channel_name: discord.Option(str, "作成するチャンネル名", default="🧪｜bot-test"),  # type: ignore[valid-type]
+) -> None:
+    """テスト用のプライベートチャンネルを作成する。
+
+    権限: @everyone view denied / 実行者 view+send allow / Bot view+send+manage allow
+    既存があればそのまま流用してIDだけ返す（idempotent）。
+    """
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    existing: discord.TextChannel | None = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing is not None:
+        await ctx.respond(
+            f"既に同名のチャンネルが存在します: {existing.mention} (ID: `{existing.id}`)",
+            ephemeral=True,
+        )
+        return
+
+    me: discord.Member = guild.me if guild.me is not None else await guild.fetch_member(bot.user.id)
+    author: discord.User | discord.Member = ctx.author
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        author:             discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        me:                 discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, manage_channels=True),
+    }
+    try:
+        created: discord.TextChannel = await guild.create_text_channel(
+            name=channel_name,
+            overwrites=overwrites,
+            reason=f"setup_dev_channel by {author}",
+        )
+    except Exception as e:
+        await ctx.respond(f"作成失敗: `{e}`", ephemeral=True)
+        return
+    await ctx.respond(
+        f"✅ テストチャンネル {created.mention} を作成しました（ID: `{created.id}`）。\n"
+        "あなたと Bot のみ閲覧可能です。他の管理者を追加したい場合は手動で permission を編集してください。",
+        ephemeral=True,
+    )
+
+
 @bot.slash_command(name="debug_check_ranks_periodically", description="定期的なランクチェックを手動で実行します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def debug_check_ranks_periodically(ctx: discord.ApplicationContext) -> None:
@@ -1401,6 +1544,34 @@ async def debug_modify_rank(ctx: discord.ApplicationContext, user: discord.Membe
 
     except Exception as e:
         await ctx.respond(f"処理中にエラーが発生しました: {e}")
+
+
+@bot.slash_command(
+    name="debug_grant_xp",
+    description="指定ユーザーにXPを付与してLvアップを強制発火させます。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_grant_xp(
+    ctx: discord.ApplicationContext,
+    user: discord.Member,
+    amount: int,
+) -> None:
+    """組分け済みユーザーに任意のXPを加算する。Lvが上がれば祝福通知も発火する。"""
+    await ctx.defer(ephemeral=True)
+    if not is_sorted(user.id):
+        await ctx.respond(f"{user.display_name} はまだ組分け帽子を被っていません。", ephemeral=True)
+        return
+    if amount == 0:
+        await ctx.respond("amount は 0 以外を指定してください。", ephemeral=True)
+        return
+    old_level, new_level = add_contribution(user.id, xp=amount, vc_seconds=0, text_messages=0)
+    msg: str = f"✅ {user.display_name} に {amount:+,} XP 加算しました（Lv {old_level} → Lv {new_level}）。"
+    if new_level > old_level:
+        msg += " Lvアップ通知が所属寮のリーダーボードに投稿されます。"
+        await notify_level_up(user.id, old_level, new_level)
+    await ctx.respond(msg, ephemeral=True)
+
 
 # --- バックグラウンドタスク ---
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=jst))
@@ -1526,13 +1697,15 @@ async def on_message(message: discord.Message) -> None:
                 return
         except ValueError:
             pass
-    add_contribution(
+    old_level, new_level = add_contribution(
         discord_id,
         xp=CONTRIBUTION_TEXT_PT_PER_MESSAGE,
         vc_seconds=0,
         text_messages=1,
         last_text_at_iso=now_utc.isoformat(),
     )
+    if new_level > old_level:
+        await notify_level_up(discord_id, old_level, new_level)
 
 
 @bot.event
@@ -1542,7 +1715,9 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if not member.bot and before.channel != after.channel:
         # 旧セッションを確定（退出 or 移動元）
         if before.channel is not None:
-            vc_session_end(member.id)
+            old_level, new_level = vc_session_end(member.id)
+            if new_level > old_level:
+                await notify_level_up(member.id, old_level, new_level)
         # 新セッション開始（入室 or 移動先）。組分け済みのみ計測対象
         if after.channel is not None and is_sorted(member.id):
             vc_session_start(member.id, after.channel.id)
