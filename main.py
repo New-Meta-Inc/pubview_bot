@@ -140,6 +140,16 @@ def setup_database() -> None:
             joined_at TEXT NOT NULL
         )
     ''')
+    # 寮ごとのDiscordチャンネルID（/setup_house_channels で作成・記録）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS house_channels (
+            house_id     TEXT NOT NULL,
+            channel_type TEXT NOT NULL,
+            channel_id   INTEGER NOT NULL,
+            created_at   TEXT NOT NULL,
+            PRIMARY KEY (house_id, channel_type)
+        )
+    ''')
     con.commit()
     con.close()
 # -----------------------------
@@ -966,6 +976,131 @@ async def dashboard(ctx: discord.ApplicationContext, channel: discord.TextChanne
 
     await target_channel.send(embed=embed, view=DashboardView())
     await ctx.respond("ダッシュボードを送信しました。", ephemeral=True)
+
+@bot.slash_command(name="setup_house_channels", description="4寮ぶんのカテゴリ・チャンネルを一括作成します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def setup_house_channels(ctx: discord.ApplicationContext) -> None:
+    """寮ごとのカテゴリと配下チャンネル（雑談/リーダーボード/VC）を一括作成する。
+
+    権限設計:
+      - カテゴリ: @everyone view denied / 寮ロール view allowed
+      - 雑談 / VC: カテゴリから継承
+      - リーダーボード: カテゴリから継承 + 寮ロール send_messages denied（Botのみ投稿可）
+
+    idempotent: 既に作成済みのチャンネルがあればスキップ、無いものだけ作る。
+    作成結果は house_channels テーブルに記録する。
+    """
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    me: discord.Member | None = guild.me
+    bot_member: discord.Member = me if me is not None else await guild.fetch_member(bot.user.id)
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    summary_lines: list[str] = []
+
+    for house_id, house_name_jp, house_emoji, role_name in HOUSES:
+        house_role: discord.Role | None = discord.utils.get(guild.roles, name=role_name)
+        if house_role is None:
+            summary_lines.append(f"⚠️ {house_emoji} {house_name_jp}: ロール「{role_name}」が見つかりません。先にロール作成が必要。")
+            continue
+
+        # カテゴリ権限: @everyone view denied / 寮ロール view allowed / Bot view allowed
+        category_overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            house_role:          discord.PermissionOverwrite(view_channel=True, connect=True),
+            bot_member:          discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, connect=True),
+        }
+
+        category_name: str = f"{house_emoji}｜{house_name_jp}"
+        category: discord.CategoryChannel | None = discord.utils.get(guild.categories, name=category_name)
+        category_created: bool = False
+        if category is None:
+            try:
+                category = await guild.create_category(name=category_name, overwrites=category_overwrites, reason=f"setup_house_channels: {house_id}")
+                category_created = True
+            except Exception as e:
+                summary_lines.append(f"❌ {house_emoji} {house_name_jp}: カテゴリ作成失敗 ({e})")
+                continue
+        else:
+            # 既存カテゴリの権限を念のため上書き（誤設定リカバリ）
+            try:
+                for target, ow in category_overwrites.items():
+                    await category.set_permissions(target, overwrite=ow, reason="setup_house_channels: enforce overwrites")
+            except Exception as e:
+                print(f"!!! setup_house_channels: failed to enforce category overwrites for {house_id}: {e}")
+
+        cur.execute(
+            "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+            (house_id, "category", category.id, now_iso),
+        )
+
+        # 配下チャンネル定義: (channel_type, name, kind, extra_overwrites)
+        # kind: "text" | "voice"
+        # extra_overwrites: リーダーボードは寮ロールに send_messages = False を上書き
+        chat_name: str = "雑談"
+        board_name: str = "リーダーボード"
+        vc_name: str = f"{house_name_jp}VC"
+
+        # リーダーボード用 overwrite（カテゴリ継承 + 寮ロールの send 拒否）
+        board_overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            house_role:          discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True),
+            bot_member:          discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+        }
+
+        sub_channels: list[tuple[str, str, str, dict[discord.Role | discord.Member, discord.PermissionOverwrite] | None]] = [
+            ("chat",        chat_name,  "text",  None),
+            ("leaderboard", board_name, "text",  board_overwrites),
+            ("vc",          vc_name,    "voice", None),
+        ]
+
+        for channel_type, name, kind, extra_ow in sub_channels:
+            existing: discord.abc.GuildChannel | None
+            if kind == "text":
+                existing = discord.utils.get(category.text_channels, name=name)
+            else:
+                existing = discord.utils.get(category.voice_channels, name=name)
+            if existing is not None:
+                cur.execute(
+                    "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+                    (house_id, channel_type, existing.id, now_iso),
+                )
+                continue
+            try:
+                if kind == "text":
+                    created = await guild.create_text_channel(
+                        name=name, category=category,
+                        overwrites=extra_ow if extra_ow is not None else category_overwrites,
+                        reason=f"setup_house_channels: {house_id}/{channel_type}",
+                    )
+                else:
+                    created = await guild.create_voice_channel(
+                        name=name, category=category, user_limit=0,
+                        reason=f"setup_house_channels: {house_id}/{channel_type}",
+                    )
+                cur.execute(
+                    "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+                    (house_id, channel_type, created.id, now_iso),
+                )
+            except Exception as e:
+                summary_lines.append(f"❌ {house_emoji} {house_name_jp}/{name}: 作成失敗 ({e})")
+
+        summary_lines.append(
+            f"{'🆕' if category_created else '♻️'} {house_emoji} {house_name_jp}: カテゴリ + 雑談 + リーダーボード + VC OK"
+        )
+
+    con.commit()
+    con.close()
+
+    msg: str = "**寮チャンネルセットアップ完了**\n" + "\n".join(summary_lines)
+    await ctx.respond(msg, ephemeral=True)
 
 @bot.slash_command(name="add_section", description="参加可能なセクションを登録します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
