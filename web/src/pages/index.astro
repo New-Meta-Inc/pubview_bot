@@ -1,0 +1,51 @@
+---
+import Layout from '../layouts/Layout.astro';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+let lastIngest: { ingested_at: string; users_count: number } | null = null;
+if (env?.DB) {
+  const row = await env.DB.prepare(
+    `SELECT ingested_at, users_count FROM ingest_log ORDER BY id DESC LIMIT 1`,
+  ).first<{ ingested_at: string; users_count: number }>();
+  lastIngest = row ?? null;
+}
+---
+<Layout title="ぱぶびゅ！ダッシュボード">
+  <main class="mx-auto max-w-3xl px-6 py-16">
+    <h1 class="text-3xl font-bold tracking-tight">ぱぶびゅ！ダッシュボード</h1>
+    <p class="mt-4 text-slate-400">Phase 3 セットアップ中。同期と画面は順次追加されます。</p>
+
+    <section class="mt-12 grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <div class="rounded-xl bg-raptor-dark/40 p-4 ring-1 ring-raptor/40">
+        <div class="text-3xl">🦖</div>
+        <div class="mt-2 text-sm text-slate-300">ラプター</div>
+      </div>
+      <div class="rounded-xl bg-krug-dark/40 p-4 ring-1 ring-krug/40">
+        <div class="text-3xl">🪨</div>
+        <div class="mt-2 text-sm text-slate-300">クルーグ</div>
+      </div>
+      <div class="rounded-xl bg-wolf-dark/40 p-4 ring-1 ring-wolf/40">
+        <div class="text-3xl">🐺</div>
+        <div class="mt-2 text-sm text-slate-300">ウルフ</div>
+      </div>
+      <div class="rounded-xl bg-gromp-dark/40 p-4 ring-1 ring-gromp/40">
+        <div class="text-3xl">🐸</div>
+        <div class="mt-2 text-sm text-slate-300">グロンプ</div>
+      </div>
+    </section>
+
+    <section class="mt-12 rounded-xl bg-slate-900/60 p-6 ring-1 ring-slate-800">
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400">同期ステータス</h2>
+      {lastIngest ? (
+        <p class="mt-2 text-slate-200">
+          最終同期: <span class="font-mono">{lastIngest.ingested_at}</span>
+          （ユーザー {lastIngest.users_count} 件）
+        </p>
+      ) : (
+        <p class="mt-2 text-slate-400">まだ同期データが届いていません。</p>
+      )}
+    </section>
+  </main>
+</Layout>

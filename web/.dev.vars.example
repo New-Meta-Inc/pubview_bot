@@ -1,0 +1,3 @@
+# Bot からの同期に使う共有シークレット
+# 本番は wrangler pages secret put INGEST_TOKEN で登録すること
+INGEST_TOKEN=replace-with-64char-random-string
