@@ -1,1 +1,16 @@
 data/
+
+# --- web/ (Astro + Cloudflare) ---
+web/node_modules/
+web/dist/
+web/.astro/
+web/.wrangler/
+web/.dev.vars
+web/.env
+web/.env.*
+!web/.dev.vars.example
+
+# OS / editor
+.DS_Store
+*.swp
+*.log
