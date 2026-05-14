@@ -37,12 +37,20 @@ interface MonthlyRow {
   text_messages: number;
 }
 
+interface HouseLeaderRow {
+  house_id: string;
+  discord_id: string;
+  set_at: string;
+  set_by?: string | null;
+}
+
 interface IngestPayload {
   bot_version?: string;
   users: UserRow[];
   sorting_hat: SortingHatRow[];
   contribution_totals: TotalsRow[];
   contribution_monthly: MonthlyRow[];
+  house_leaders?: HouseLeaderRow[];
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
@@ -68,7 +76,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
   }
 
-  const { users = [], sorting_hat = [], contribution_totals = [], contribution_monthly = [] } = payload;
+  const { users = [], sorting_hat = [], contribution_totals = [], contribution_monthly = [], house_leaders = [] } = payload;
 
   const statements: D1PreparedStatement[] = [];
 
@@ -141,6 +149,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
     );
   }
 
+  for (const l of house_leaders) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO house_leaders (house_id, discord_id, set_at, set_by)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(house_id) DO UPDATE SET
+           discord_id = excluded.discord_id,
+           set_at     = excluded.set_at,
+           set_by     = excluded.set_by`,
+      ).bind(l.house_id, l.discord_id, l.set_at, l.set_by ?? null),
+    );
+  }
+
   statements.push(
     env.DB.prepare(
       `INSERT INTO ingest_log (ingested_at, users_count, sorting_count, totals_count, monthly_count, bot_version)
@@ -165,6 +186,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
         sorting_hat: sorting_hat.length,
         contribution_totals: contribution_totals.length,
         contribution_monthly: contribution_monthly.length,
+        house_leaders: house_leaders.length,
       },
     }),
     { status: 200, headers: { 'content-type': 'application/json' } },
