@@ -317,15 +317,31 @@ async def notify_level_up(discord_id: int, old_level: int, new_level: int) -> No
     if new_level - old_level >= 2:
         title = f"🎉🎉 {new_level - old_level}連Lv UP!"
 
+    # 個人ページURL（display_name 経由）。失敗時はトップにフォールバック
+    user_page_url: str = "https://pubview-dashboard.pages.dev/"
+    try:
+        guild_for_member: discord.Guild | None = bot.get_guild(DISCORD_GUILD_ID)
+        member_obj: discord.Member | None = None
+        if guild_for_member is not None:
+            member_obj = guild_for_member.get_member(discord_id)
+            if member_obj is None:
+                member_obj = await guild_for_member.fetch_member(discord_id)
+        if member_obj is not None:
+            import urllib.parse as _up
+            user_page_url = f"https://pubview-dashboard.pages.dev/u/{_up.quote(member_obj.display_name, safe='')}"
+    except Exception:
+        pass
+
     embed: discord.Embed = discord.Embed(
         title=title,
+        url=user_page_url,
         description=f"<@{discord_id}> さんが **Lv {new_level}** に到達しました！",
         color=discord.Color.gold(),
     )
     embed.add_field(name="所属", value=f"{house_emoji} {house_name_jp}", inline=True)
     embed.add_field(name="現在", value=f"Lv {new_level}", inline=True)
     embed.add_field(name=f"次Lv {new_level + 1} まで", value=f"あと **{remaining:,} XP**（{in_lv:,}/{span:,}）", inline=False)
-    embed.set_footer(text="Webダッシュボード: https://pubview-dashboard.pages.dev/")
+    embed.add_field(name="​", value=f"[📊 ダッシュボードで詳細を見る →]({user_page_url})", inline=False)
     try:
         await channel.send(
             embed=embed,
@@ -1164,13 +1180,15 @@ async def leaderboard(
             f"`#{i:>2}` {_house_emoji(house_id)} {member_name} ・ Lv {lv} ・ **{_fmt_int(value)} {primary_label}**"
         )
 
+    dashboard_lb_url: str = f"https://pubview-dashboard.pages.dev/leaderboard?mode={mode}"
     embed.description = "\n".join(lines)
-    embed.set_footer(
-        text=(
-            "mode=total: 累積XP順 / mode=monthly: 今月pt順"
-            f"\nWebダッシュボード: https://pubview-dashboard.pages.dev/"
-        )
+    embed.url = dashboard_lb_url
+    embed.add_field(
+        name="​",
+        value=f"[📊 Webダッシュボードのランキングを開く →]({dashboard_lb_url})",
+        inline=False,
     )
+    embed.set_footer(text="mode=total: 累積XP順 / mode=monthly: 今月pt順")
     await ctx.respond(embed=embed)
 
 
@@ -1236,7 +1254,12 @@ async def house_standings(ctx: discord.ApplicationContext) -> None:
             inline=False,
         )
 
-    embed.set_footer(text="Webダッシュボード: https://pubview-dashboard.pages.dev/")
+    embed.url = "https://pubview-dashboard.pages.dev/"
+    embed.add_field(
+        name="​",
+        value="[📊 Webダッシュボードを開く →](https://pubview-dashboard.pages.dev/)",
+        inline=False,
+    )
     await ctx.respond(embed=embed)
 # -----------------------------
 
@@ -1852,8 +1875,10 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
         rank_line = f"🏃 順位: 4寮中 {rank}位 / 1位{HOUSE_BY_ID[standings[0][0]][1]}まで +{leader_pt - house_gained:,} pt"
 
     desc: str = "\n".join(kpi_lines)
+    house_page_url: str = f"https://pubview-dashboard.pages.dev/houses/{house_id}"
     embed: discord.Embed = discord.Embed(
         title=f"{house_emoji} {house_name_jp} 週次ダイジェスト",
+        url=house_page_url,
         description=(
             f"📅 {this_monday.strftime('%Y年%m月%d日')} 〜 {this_sunday.strftime('%Y年%m月%d日')}\n\n"
             f"📊 主要指標 (KPIs)\n{desc}"
@@ -1866,7 +1891,11 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
         embed.add_field(name="🏆 トップコントリビューター", value="\n\n".join(top_lines)[:1024], inline=False)
     if rank_line:
         embed.add_field(name="📈 トレンド", value=rank_line, inline=False)
-    embed.set_footer(text=f"Webダッシュボード: {DASHBOARD_URL}")
+    embed.add_field(
+        name="​",
+        value=f"[📊 {house_name_jp} の寮ページを見る →]({house_page_url})",
+        inline=False,
+    )
     try:
         await channel.send(
             embed=embed,
@@ -1947,8 +1976,10 @@ async def post_monthly_summary(year_month_override: str | None = None) -> str:
             house_emoji: str = HOUSE_BY_ID[hid][2]
             mvp_lines.append(f"`#{i}` {house_emoji} <@{did}> — **{pt:,} pt**")
 
+    monthly_page_url: str = f"https://pubview-dashboard.pages.dev/monthly/{target_ym}"
     embed: discord.Embed = discord.Embed(
         title=f"📅 {target_ym} 月次サマリ",
+        url=monthly_page_url,
         color=discord.Color.gold(),
     )
     embed.add_field(
@@ -1961,7 +1992,11 @@ async def post_monthly_summary(year_month_override: str | None = None) -> str:
         value="\n".join(mvp_lines) if mvp_lines else "（記録なし）",
         inline=False,
     )
-    embed.set_footer(text=f"Webダッシュボード: {DASHBOARD_URL}")
+    embed.add_field(
+        name="​",
+        value=f"[📊 {target_ym} のアーカイブを見る →]({monthly_page_url})",
+        inline=False,
+    )
     try:
         await channel.send(
             embed=embed,
