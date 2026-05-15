@@ -1,0 +1,254 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { HOUSES, houseById, levelFromXp, requiredXpForLevel, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP, USER_LEVEL_COEF, USER_LEVEL_EXP } from '../lib/houses.ts';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+
+const currentYm = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 7);
+
+interface HouseStats {
+  house_id: string;
+  member_count: number;
+  total_xp: number;
+  monthly_points: number;
+}
+interface TopMember {
+  discord_id: string;
+  display_name: string;
+  house_id: string;
+  points: number;
+  total_xp: number;
+}
+interface LastIngest {
+  ingested_at: string;
+  users_count: number;
+}
+
+let houseStats: HouseStats[] = [];
+let topByHouse: Record<string, TopMember[]> = {};
+let overallTop: TopMember[] = [];
+let lastIngest: LastIngest | null = null;
+let leaderByHouse: Record<string, string> = {};
+
+if (env?.DB) {
+  const statsResult = await env.DB.prepare(
+    `SELECT sh.house_id,
+            COUNT(DISTINCT sh.discord_id) AS member_count,
+            COALESCE(SUM(ct.total_xp), 0)    AS total_xp,
+            COALESCE(SUM(cm.points), 0)      AS monthly_points
+     FROM sorting_hat sh
+     LEFT JOIN contribution_totals ct ON sh.discord_id = ct.discord_id
+     LEFT JOIN contribution_monthly cm
+       ON sh.discord_id = cm.discord_id AND cm.year_month = ?
+     GROUP BY sh.house_id`,
+  ).bind(currentYm).all<HouseStats>();
+  houseStats = statsResult.results ?? [];
+
+  const overallResult = await env.DB.prepare(
+    `SELECT u.discord_id, u.display_name, sh.house_id,
+            COALESCE(cm.points, 0)   AS points,
+            COALESCE(ct.total_xp, 0) AS total_xp
+     FROM users u
+     JOIN sorting_hat sh ON u.discord_id = sh.discord_id
+     LEFT JOIN contribution_totals ct ON u.discord_id = ct.discord_id
+     LEFT JOIN contribution_monthly cm
+       ON u.discord_id = cm.discord_id AND cm.year_month = ?
+     ORDER BY points DESC
+     LIMIT 10`,
+  ).bind(currentYm).all<TopMember>();
+  overallTop = overallResult.results ?? [];
+
+  for (const h of HOUSES) {
+    const r = await env.DB.prepare(
+      `SELECT u.discord_id, u.display_name, sh.house_id,
+              COALESCE(cm.points, 0)   AS points,
+              COALESCE(ct.total_xp, 0) AS total_xp
+       FROM users u
+       JOIN sorting_hat sh ON u.discord_id = sh.discord_id
+       LEFT JOIN contribution_totals ct ON u.discord_id = ct.discord_id
+       LEFT JOIN contribution_monthly cm
+         ON u.discord_id = cm.discord_id AND cm.year_month = ?
+       WHERE sh.house_id = ?
+       ORDER BY points DESC
+       LIMIT 5`,
+    ).bind(currentYm, h.id).all<TopMember>();
+    topByHouse[h.id] = r.results ?? [];
+  }
+
+  const last = await env.DB.prepare(
+    `SELECT ingested_at, users_count FROM ingest_log ORDER BY id DESC LIMIT 1`,
+  ).first<LastIngest>();
+  lastIngest = last ?? null;
+
+  const leaders = await env.DB.prepare(
+    `SELECT hl.house_id, u.display_name AS leader_name
+     FROM house_leaders hl
+     LEFT JOIN users u ON hl.discord_id = u.discord_id`,
+  ).all<{ house_id: string; leader_name: string | null }>();
+  for (const row of leaders.results ?? []) {
+    if (row.leader_name) leaderByHouse[row.house_id] = row.leader_name;
+  }
+}
+
+function statsFor(houseId: string): HouseStats {
+  return houseStats.find((s) => s.house_id === houseId) ?? {
+    house_id: houseId, member_count: 0, total_xp: 0, monthly_points: 0,
+  };
+}
+
+function fmt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
+function formatHours(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+function userLevelInfo(xp: number) {
+  const level = levelFromXp(xp, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const curXp = requiredXpForLevel(level, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const nextXp = requiredXpForLevel(level + 1, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const progress = nextXp > curXp ? Math.min(100, Math.max(0, ((xp - curXp) / (nextXp - curXp)) * 100)) : 0;
+  return { level, curXp, nextXp, progress, inLevel: xp - curXp, span: nextXp - curXp };
+}
+---
+<Layout title="ぱぶびゅ！ダッシュボード">
+  <main class="mx-auto max-w-6xl px-4 py-10 sm:px-6 sm:py-16">
+    <header class="flex flex-col gap-1">
+      <p class="text-xs uppercase tracking-[0.3em] text-slate-500">pubview / contribution dashboard</p>
+      <h1 class="text-3xl font-bold tracking-tight sm:text-4xl">寮対抗ボード</h1>
+      <p class="mt-1 text-sm text-slate-400">
+        {currentYm} の貢献度 ・ <span class="font-mono">{lastIngest ? `last sync ${new Date(lastIngest.ingested_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}` : 'no sync yet'}</span>
+      </p>
+    </header>
+
+    <!-- 4寮カード -->
+    <section class="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {HOUSES.map((h) => {
+        const s = statsFor(h.id);
+        const level = levelFromXp(s.total_xp, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+        const curXp = requiredXpForLevel(level, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+        const nextXp = requiredXpForLevel(level + 1, HOUSE_LEVEL_COEF, HOUSE_LEVEL_EXP);
+        const progress = nextXp > curXp ? Math.min(100, Math.max(0, ((s.total_xp - curXp) / (nextXp - curXp)) * 100)) : 0;
+        const tops = topByHouse[h.id] ?? [];
+        return (
+          <article class={`group relative rounded-2xl ${h.themeBg} p-5 ring-1 ${h.themeRing} transition hover:ring-2`}>
+            <a href={`/houses/${h.id}`} class="absolute inset-0 z-0 rounded-2xl" aria-label={`${h.name} の詳細`}></a>
+            <div class="relative z-10 flex items-start justify-between">
+              <div>
+                <div class="text-4xl leading-none">{h.emoji}</div>
+                <h2 class={`mt-2 text-lg font-bold ${h.themeAccent}`}>{h.name}</h2>
+                <p class="mt-0.5 text-xs text-slate-400">
+                  寮長: {leaderByHouse[h.id] ? <span class="text-slate-200">{leaderByHouse[h.id]}</span> : <span class="text-slate-500">未任命</span>}
+                </p>
+              </div>
+              <div class="text-right">
+                <div class="text-xs text-slate-400">寮Lv</div>
+                <div class="text-2xl font-black tabular-nums">{level}</div>
+              </div>
+            </div>
+
+            <div class="mt-3">
+              <div class="flex items-baseline justify-between text-xs text-slate-400">
+                <span>{fmt(s.total_xp - curXp)} / {fmt(nextXp - curXp)} XP</span>
+                <span>次Lvまで</span>
+              </div>
+              <div class="mt-1 h-2 overflow-hidden rounded-full bg-slate-900/70">
+                <div class={`h-full ${h.themeBar}`} style={`width: ${progress}%`}></div>
+              </div>
+            </div>
+
+            <dl class="mt-4 grid grid-cols-2 gap-2 text-sm">
+              <div>
+                <dt class="text-xs text-slate-400">今月pt</dt>
+                <dd class="font-bold tabular-nums">{fmt(s.monthly_points)}</dd>
+              </div>
+              <div>
+                <dt class="text-xs text-slate-400">メンバー</dt>
+                <dd class="font-bold tabular-nums">{s.member_count}人</dd>
+              </div>
+            </dl>
+
+            <div class="mt-4 border-t border-slate-700/40 pt-3">
+              <p class="mb-1 text-xs uppercase tracking-wider text-slate-400">今月トップ</p>
+              {tops.length === 0 ? (
+                <p class="text-xs text-slate-500">まだ記録なし</p>
+              ) : (
+                <ol class="space-y-1.5 text-sm">
+                  {tops.map((m, i) => {
+                    const lv = userLevelInfo(m.total_xp);
+                    return (
+                      <li class="relative flex items-baseline justify-between gap-3">
+                        <span class="truncate">
+                          <span class="mr-1 text-slate-500 tabular-nums">{i + 1}.</span>
+                          <a href={`/u/${encodeURIComponent(m.display_name)}`} class="relative z-10 hover:underline">{m.display_name}</a>
+                          <span class="ml-1.5 rounded bg-slate-800/80 px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-200">Lv {lv.level}</span>
+                        </span>
+                        <span class="font-mono text-xs text-slate-300 tabular-nums">{fmt(m.points)}</span>
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+            </div>
+          </article>
+        );
+      })}
+    </section>
+
+    <!-- 全体ランキング -->
+    <section class="mt-10 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+      <div class="flex items-baseline justify-between">
+        <h2 class="text-lg font-bold">今月の全体ランキング</h2>
+        <p class="text-xs text-slate-500">Top 10</p>
+      </div>
+      <ol class="mt-4 divide-y divide-slate-800">
+        {overallTop.length === 0 ? (
+          <li class="py-4 text-sm text-slate-500">まだデータがありません</li>
+        ) : (
+          overallTop.map((m, i) => {
+            const h = houseById(m.house_id);
+            const lv = userLevelInfo(m.total_xp);
+            return (
+              <li class="flex items-center gap-3 py-3 text-sm">
+                <span class="w-8 text-right font-mono text-slate-500 tabular-nums">#{i + 1}</span>
+                <span class={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-base ${h?.themeBg ?? 'bg-slate-800'} ${h?.themeRing ?? 'ring-slate-700'} ring-1`}>
+                  {h?.emoji ?? '?'}
+                </span>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <a href={`/u/${encodeURIComponent(m.display_name)}`} class="truncate font-medium hover:underline">{m.display_name}</a>
+                    <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-100 ${h?.themeBar ?? 'bg-slate-700'}`}>Lv {lv.level}</span>
+                  </div>
+                  <div class="mt-1 flex items-center gap-2">
+                    <div class="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-800">
+                      <div class={`h-full ${h?.themeBar ?? 'bg-slate-600'}`} style={`width: ${lv.progress}%`}></div>
+                    </div>
+                    <span class="shrink-0 font-mono text-[10px] text-slate-500 tabular-nums">{fmt(lv.inLevel)}/{fmt(lv.span)} XP</span>
+                  </div>
+                </div>
+                <span class="shrink-0 font-mono text-slate-300 tabular-nums">{fmt(m.points)} pt</span>
+              </li>
+            );
+          })
+        )}
+      </ol>
+    </section>
+
+    <footer class="mt-12 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-6 text-xs text-slate-500">
+      <div class="flex flex-wrap gap-3">
+        <a href="/leaderboard" class="hover:text-slate-200">🏆 全体ランキング</a>
+        <a href={`/monthly/${currentYm}`} class="hover:text-slate-200">📅 月次アーカイブ</a>
+      </div>
+      <div class="flex flex-wrap gap-3 text-slate-500">
+        {HOUSES.map((h) => (
+          <a href={`/houses/${h.id}`} class="hover:text-slate-200">{h.emoji} {h.name}</a>
+        ))}
+      </div>
+    </footer>
+  </main>
+</Layout>

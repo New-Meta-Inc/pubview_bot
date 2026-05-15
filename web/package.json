@@ -1,0 +1,26 @@
+{
+  "name": "pubview-dashboard",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "wrangler pages dev ./dist",
+    "deploy": "astro build && wrangler pages deploy ./dist --project-name pubview-dashboard",
+    "d1:apply": "wrangler d1 migrations apply pubview-dashboard-db --remote",
+    "d1:apply:local": "wrangler d1 migrations apply pubview-dashboard-db --local",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/cloudflare": "^12.5.0",
+    "@astrojs/tailwind": "^6.0.0",
+    "astro": "^5.7.0",
+    "tailwindcss": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

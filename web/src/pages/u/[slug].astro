@@ -1,0 +1,349 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import { houseById, levelFromXp, requiredXpForLevel, USER_LEVEL_COEF, USER_LEVEL_EXP } from '../../lib/houses.ts';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+
+const slug = decodeURIComponent(Astro.params.slug ?? '');
+if (!slug) {
+  return new Response('User not found', { status: 404 });
+}
+
+interface UserData {
+  discord_id: string;
+  display_name: string;
+  avatar_url: string | null;
+  house_id: string | null;
+  total_xp: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+interface MonthlyRow {
+  year_month: string;
+  points: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+interface DailySnapshotRow {
+  snapshot_date: string;
+  total_xp: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+
+let user: UserData | null = null;
+let monthlyHistory: MonthlyRow[] = [];
+let dailySnapshots: DailySnapshotRow[] = [];
+let overallRank: number | null = null;
+let houseRank: number | null = null;
+let houseMemberCount: number = 0;
+
+if (env?.DB) {
+  // 1) ユーザー基本情報 + 所属寮 + 累積
+  const u = await env.DB.prepare(
+    `SELECT u.discord_id, u.display_name, u.avatar_url,
+            sh.house_id,
+            COALESCE(ct.total_xp, 0)      AS total_xp,
+            COALESCE(ct.vc_seconds, 0)    AS vc_seconds,
+            COALESCE(ct.text_messages, 0) AS text_messages
+     FROM users u
+     LEFT JOIN sorting_hat sh ON u.discord_id = sh.discord_id
+     LEFT JOIN contribution_totals ct ON u.discord_id = ct.discord_id
+     WHERE u.display_name = ?
+     LIMIT 1`,
+  ).bind(slug).first<UserData>();
+  user = u ?? null;
+
+  if (user) {
+    // 2) 月別履歴（直近12ヶ月）
+    const m = await env.DB.prepare(
+      `SELECT year_month, points, vc_seconds, text_messages
+       FROM contribution_monthly
+       WHERE discord_id = ?
+       ORDER BY year_month DESC
+       LIMIT 12`,
+    ).bind(user.discord_id).all<MonthlyRow>();
+    monthlyHistory = m.results ?? [];
+
+    // 2.5) 日次スナップショット（直近31日 + 当日比較用に少し多めで取得、後でclient側で diff 計算）
+    const ds = await env.DB.prepare(
+      `SELECT snapshot_date, total_xp, vc_seconds, text_messages
+       FROM daily_snapshots
+       WHERE discord_id = ?
+       ORDER BY snapshot_date DESC
+       LIMIT 35`,
+    ).bind(user.discord_id).all<DailySnapshotRow>();
+    dailySnapshots = (ds.results ?? []).slice().reverse(); // 古い順
+
+    // 3) 全体ランク（累積XP順）
+    const allRank = await env.DB.prepare(
+      `SELECT 1 + COUNT(*) AS rk
+       FROM sorting_hat s
+       JOIN contribution_totals ct ON s.discord_id = ct.discord_id
+       WHERE ct.total_xp > ?`,
+    ).bind(user.total_xp).first<{ rk: number }>();
+    overallRank = allRank?.rk ?? null;
+
+    // 4) 寮内ランク + 寮メンバー数
+    if (user.house_id) {
+      const hr = await env.DB.prepare(
+        `SELECT 1 + COUNT(*) AS rk
+         FROM sorting_hat s
+         JOIN contribution_totals ct ON s.discord_id = ct.discord_id
+         WHERE s.house_id = ? AND ct.total_xp > ?`,
+      ).bind(user.house_id, user.total_xp).first<{ rk: number }>();
+      houseRank = hr?.rk ?? null;
+
+      const hc = await env.DB.prepare(
+        `SELECT COUNT(*) AS cnt FROM sorting_hat WHERE house_id = ?`,
+      ).bind(user.house_id).first<{ cnt: number }>();
+      houseMemberCount = hc?.cnt ?? 0;
+    }
+  }
+}
+
+if (!user) {
+  return new Response(`User "${slug}" not found`, { status: 404 });
+}
+
+const houseDef = user.house_id ? houseById(user.house_id) : undefined;
+const lv = levelFromXp(user.total_xp, USER_LEVEL_COEF, USER_LEVEL_EXP);
+const curXp = requiredXpForLevel(lv, USER_LEVEL_COEF, USER_LEVEL_EXP);
+const nextXp = requiredXpForLevel(lv + 1, USER_LEVEL_COEF, USER_LEVEL_EXP);
+const inLv = user.total_xp - curXp;
+const span = Math.max(1, nextXp - curXp);
+const progress = Math.min(100, Math.max(0, (inLv / span) * 100));
+
+const currentYm = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 7);
+const currentMonth = monthlyHistory.find((m) => m.year_month === currentYm);
+
+function fmt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+function vcHM(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
+// 日次グラフ用データ: 連続した日付の系列を生成し、各日の獲得XP(=当日total_xp - 前日total_xp)を計算
+interface DailyPoint {
+  date: string;        // YYYY-MM-DD
+  label: string;       // M/D
+  gainedXp: number;
+  cumulativeXp: number;
+}
+function buildDailyChart(snapshots: DailySnapshotRow[], currentTotalXp: number, days: number = 30): DailyPoint[] {
+  const tzDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+  const byDate = new Map<string, DailySnapshotRow>();
+  for (const s of snapshots) byDate.set(s.snapshot_date, s);
+  // 直近 days+1 日分の系列（前日比較で初日が0になる分1日多く取る）
+  const points: DailyPoint[] = [];
+  let prevTotal = 0;
+  for (let i = days; i >= 0; i--) {
+    const d = new Date(tzDate.getTime() - i * 24 * 60 * 60 * 1000);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const label = `${d.getMonth() + 1}/${d.getDate()}`;
+    const row = byDate.get(iso);
+    // 「今日(=i==0)」は現在の累積XPを使い、進行中の獲得分も反映
+    let cumulative: number;
+    if (i === 0) {
+      cumulative = currentTotalXp;
+    } else {
+      cumulative = row ? row.total_xp : prevTotal;
+    }
+    const gained = Math.max(0, cumulative - prevTotal);
+    points.push({ date: iso, label, gainedXp: gained, cumulativeXp: cumulative });
+    prevTotal = cumulative;
+  }
+  return points.slice(1); // 基準点を捨てる
+}
+---
+<Layout title={`${user.display_name} | ぱぶびゅ！ダッシュボード`}>
+  <main class="mx-auto max-w-3xl px-4 py-10 sm:px-6 sm:py-14">
+    <nav class="mb-6 text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-200">← 寮対抗ボードへ戻る</a>
+    </nav>
+
+    <header class="rounded-2xl bg-slate-900/60 p-6 ring-1 ring-slate-800 sm:p-8">
+      <div class="flex flex-col items-center gap-4 sm:flex-row sm:items-end sm:gap-6">
+        <img
+          src={user.avatar_url ?? '/favicon.svg'}
+          alt=""
+          class="h-24 w-24 rounded-full bg-slate-800 object-cover ring-2 ring-slate-700"
+        />
+        <div class="flex-1 text-center sm:text-left">
+          <h1 class="text-2xl font-black tracking-tight sm:text-3xl">{user.display_name}</h1>
+          {houseDef ? (
+            <a href={`/houses/${houseDef.id}`} class={`mt-1 inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-xs font-semibold ${houseDef.themeBg} ${houseDef.themeAccent} ring-1 ${houseDef.themeRing}`}>
+              {houseDef.emoji} {houseDef.name}
+            </a>
+          ) : (
+            <span class="mt-1 inline-block text-xs text-slate-500">未組分け</span>
+          )}
+        </div>
+        <div class="text-center sm:text-right">
+          <div class="text-xs text-slate-400">個人レベル</div>
+          <div class="text-5xl font-black tabular-nums">{lv}</div>
+        </div>
+      </div>
+
+      <div class="mt-5">
+        <div class="flex items-baseline justify-between text-xs text-slate-300">
+          <span>{fmt(inLv)} / {fmt(span)} XP</span>
+          <span>次Lv {lv + 1} まで</span>
+        </div>
+        <div class="mt-1 h-2.5 overflow-hidden rounded-full bg-slate-900/70">
+          <div class={`h-full ${houseDef?.themeBar ?? 'bg-slate-600'}`} style={`width: ${progress}%`}></div>
+        </div>
+      </div>
+    </header>
+
+    <section class="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">累積XP</div>
+        <div class="mt-1 text-xl font-bold tabular-nums">{fmt(user.total_xp)}</div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">今月pt</div>
+        <div class="mt-1 text-xl font-bold tabular-nums">{fmt(currentMonth?.points ?? 0)}</div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">累積VC</div>
+        <div class="mt-1 text-xl font-bold tabular-nums">{vcHM(user.vc_seconds)}</div>
+      </div>
+      <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+        <div class="text-xs text-slate-400">累積投稿</div>
+        <div class="mt-1 text-xl font-bold tabular-nums">{fmt(user.text_messages)}</div>
+      </div>
+    </section>
+
+    {(overallRank !== null || houseRank !== null) && (
+      <section class="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {overallRank !== null && (
+          <div class="rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800">
+            <div class="text-xs text-slate-400">全体ランク（累積XP順）</div>
+            <div class="mt-1 text-2xl font-bold tabular-nums">#{overallRank}</div>
+          </div>
+        )}
+        {houseRank !== null && houseDef && (
+          <div class={`rounded-xl ${houseDef.themeBg} p-4 ring-1 ${houseDef.themeRing}`}>
+            <div class="text-xs text-slate-300">{houseDef.emoji} {houseDef.name} 内ランク</div>
+            <div class={`mt-1 text-2xl font-bold tabular-nums ${houseDef.themeAccent}`}>#{houseRank} / {houseMemberCount}人</div>
+          </div>
+        )}
+      </section>
+    )}
+
+    {(() => {
+      const points = buildDailyChart(dailySnapshots, user.total_xp, 30);
+      const maxGain = Math.max(1, ...points.map((p) => p.gainedXp));
+      const totalGain30d = points.reduce((s, p) => s + p.gainedXp, 0);
+      const chartW = 600;
+      const chartH = 140;
+      const padTop = 8;
+      const padBottom = 22;
+      const barAreaH = chartH - padTop - padBottom;
+      const barW = chartW / points.length;
+      const accent = houseDef?.themeBar?.replace('bg-', '') ?? 'slate-500';
+      const accentColor = {
+        'raptor': '#3FA34D',
+        'krug':   '#A0522D',
+        'wolf':   '#5B7C99',
+        'gromp':  '#7A5FA8',
+      }[houseDef?.id ?? ''] ?? '#64748b';
+      return (
+        <section class="mt-8 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+          <div class="flex items-baseline justify-between">
+            <h2 class="text-lg font-bold">📈 日次成果（過去30日）</h2>
+            <p class="text-xs text-slate-500">
+              直近30日: <span class="font-mono tabular-nums text-slate-300">+{fmt(totalGain30d)} XP</span>
+            </p>
+          </div>
+          {totalGain30d === 0 ? (
+            <p class="mt-6 text-sm text-slate-500">この30日間の獲得XPはまだありません。テキスト投稿やVC在室で貯まり始めます。</p>
+          ) : (
+            <div class="mt-4 overflow-x-auto">
+              <svg viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="none" class="h-36 w-full">
+                {points.map((p, i) => {
+                  const h = (p.gainedXp / maxGain) * barAreaH;
+                  const x = i * barW + 1;
+                  const y = padTop + (barAreaH - h);
+                  return (
+                    <g>
+                      <rect
+                        x={x}
+                        y={y}
+                        width={Math.max(1, barW - 2)}
+                        height={Math.max(h, p.gainedXp > 0 ? 1 : 0)}
+                        fill={accentColor}
+                        opacity={p.gainedXp > 0 ? 0.9 : 0.15}
+                        rx="1"
+                      >
+                        <title>{`${p.date}: +${p.gainedXp.toLocaleString()} XP (累積 ${p.cumulativeXp.toLocaleString()})`}</title>
+                      </rect>
+                      {/* 5日ごと + 最終日に日付ラベル */}
+                      {(i % 5 === 0 || i === points.length - 1) && (
+                        <text
+                          x={x + barW / 2}
+                          y={chartH - 6}
+                          text-anchor="middle"
+                          font-size="9"
+                          fill="#64748b"
+                          font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+                        >
+                          {p.label}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+                {/* 上部最大値ラベル */}
+                <text x="2" y={padTop + 8} font-size="9" fill="#475569" font-family="ui-monospace">
+                  最大 {fmt(maxGain)} XP
+                </text>
+              </svg>
+            </div>
+          )}
+          <p class="mt-2 text-[10px] text-slate-500">
+            ※ バーにカーソルを乗せると詳細表示。今日のバーは進行中。
+          </p>
+        </section>
+      );
+    })()}
+
+    <section class="mt-8 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+      <h2 class="text-lg font-bold">月別履歴</h2>
+      {monthlyHistory.length === 0 ? (
+        <p class="mt-3 text-sm text-slate-500">まだ記録がありません。</p>
+      ) : (
+        <table class="mt-4 w-full text-sm">
+          <thead class="text-xs uppercase tracking-wider text-slate-500">
+            <tr>
+              <th class="py-2 text-left font-normal">年月</th>
+              <th class="py-2 text-right font-normal">pt</th>
+              <th class="py-2 text-right font-normal">VC</th>
+              <th class="py-2 text-right font-normal">投稿</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-800">
+            {monthlyHistory.map((m) => (
+              <tr>
+                <td class="py-2.5 font-mono">{m.year_month}{m.year_month === currentYm ? <span class="ml-2 rounded bg-slate-700 px-1.5 py-0.5 text-[10px] font-normal text-slate-200">今月</span> : ''}</td>
+                <td class="py-2.5 text-right font-mono tabular-nums">{fmt(m.points)}</td>
+                <td class="py-2.5 text-right font-mono tabular-nums">{vcHM(m.vc_seconds)}</td>
+                <td class="py-2.5 text-right font-mono tabular-nums">{fmt(m.text_messages)}件</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+
+    <footer class="mt-8 text-center text-xs text-slate-500">
+      <a href="/leaderboard" class="hover:text-slate-300">全体ランキングへ →</a>
+    </footer>
+  </main>
+</Layout>

@@ -2,9 +2,11 @@ import os
 import sqlite3
 import datetime
 import time
+import json
 import random
 import string
 from typing import Any
+import aiohttp
 import discord
 from discord.ext import tasks
 from riotwatcher import RiotWatcher, LolWatcher, ApiError
@@ -15,6 +17,9 @@ DISCORD_TOKEN: str | None = os.getenv('DISCORD_TOKEN')
 RIOT_API_KEY: str | None = os.getenv('RIOT_API_KEY')
 DISCORD_GUILD_ID: int = int(os.getenv('DISCORD_GUILD_ID'))
 DB_PATH: str = '/data/lol_bot.db'
+CLOUDFLARE_INGEST_URL: str | None = os.getenv('CLOUDFLARE_INGEST_URL')
+INGEST_TOKEN: str | None = os.getenv('INGEST_TOKEN')
+BOT_VERSION: str = "phase3-2"
 NOTIFICATION_CHANNEL_ID: int = 1401719055643312219 # 通知用チャンネルID
 HONOR_CHANNEL_ID: int = 1447166222591594607 # 名誉用チャンネルID
 VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125
@@ -59,6 +64,24 @@ RATE_BRACKET_OF_TIER: dict[str, str] = {
 }
 # ----------------
 
+# --- コントリビューション機能の設定 ---
+# ポイント発生源（バランス調整時はここを変更）
+CONTRIBUTION_VC_PT_PER_MINUTE: int = 1
+CONTRIBUTION_TEXT_PT_PER_MESSAGE: int = 2
+CONTRIBUTION_TEXT_COOLDOWN_SECONDS: int = 60
+
+# レベル式: 累積XP = COEF * level^EXP に達したら次のレベル
+# 個人:  Lv N 必要累積XP = 20 * N^2   （Lv50 ≈ 50,000 XP）
+# 寮:    Lv N 必要累積XP = 300 * N^2  （個人式の15倍重い、特典設計用に長期目標化）
+CONTRIBUTION_USER_LEVEL_COEF: int = 20
+CONTRIBUTION_USER_LEVEL_EXP: float = 2.0
+CONTRIBUTION_HOUSE_LEVEL_COEF: int = 300
+CONTRIBUTION_HOUSE_LEVEL_EXP: float = 2.0
+# -----------------------------
+
+# JST（モジュール全体で共用）
+jst: datetime.timezone = datetime.timezone(datetime.timedelta(hours=9))
+
 # --- データベースの初期設定 ---
 def setup_database() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -92,8 +115,296 @@ def setup_database() -> None:
             sorted_at TEXT NOT NULL
         )
     ''')
+    # コントリビューション: 個人累積（永続）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS contribution_totals (
+            discord_id INTEGER PRIMARY KEY,
+            total_xp INTEGER NOT NULL DEFAULT 0,
+            vc_seconds INTEGER NOT NULL DEFAULT 0,
+            text_messages INTEGER NOT NULL DEFAULT 0,
+            last_text_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    # コントリビューション: 月次集計（JST月初リセット相当、年月キーで分離）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS contribution_monthly (
+            year_month TEXT NOT NULL,
+            discord_id INTEGER NOT NULL,
+            points INTEGER NOT NULL DEFAULT 0,
+            vc_seconds INTEGER NOT NULL DEFAULT 0,
+            text_messages INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (year_month, discord_id)
+        )
+    ''')
+    # コントリビューション: VC在室セッション（joinで記録、leaveで秒数確定→totals/monthly加算）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS vc_sessions (
+            discord_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL
+        )
+    ''')
+    # 寮ごとのDiscordチャンネルID（/setup_house_channels で作成・記録）
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS house_channels (
+            house_id     TEXT NOT NULL,
+            channel_type TEXT NOT NULL,
+            channel_id   INTEGER NOT NULL,
+            created_at   TEXT NOT NULL,
+            PRIMARY KEY (house_id, channel_type)
+        )
+    ''')
+    # 週次スナップショット: 週次ダイジェストの「先週比」算定に使用
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS weekly_snapshots (
+            snapshot_date  TEXT NOT NULL,
+            discord_id     INTEGER NOT NULL,
+            total_xp       INTEGER NOT NULL DEFAULT 0,
+            vc_seconds     INTEGER NOT NULL DEFAULT 0,
+            text_messages  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (snapshot_date, discord_id)
+        )
+    ''')
+    # 日次スナップショット: 個人ページの「日次成果グラフ」算定に使用
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS daily_snapshots (
+            snapshot_date  TEXT NOT NULL,
+            discord_id     INTEGER NOT NULL,
+            total_xp       INTEGER NOT NULL DEFAULT 0,
+            vc_seconds     INTEGER NOT NULL DEFAULT 0,
+            text_messages  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (snapshot_date, discord_id)
+        )
+    ''')
+    # 寮長: 管理者が手動で任命。D1への同期も同形式
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS house_leaders (
+            house_id   TEXT PRIMARY KEY,
+            discord_id INTEGER NOT NULL,
+            set_at     TEXT NOT NULL,
+            set_by     INTEGER
+        )
+    ''')
     con.commit()
     con.close()
+# -----------------------------
+
+# --- コントリビューション機能のヘルパー ---
+def is_sorted(discord_id: int) -> bool:
+    """組分け帽子を被ったメンバーかどうか"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT 1 FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    found: bool = cur.fetchone() is not None
+    con.close()
+    return found
+
+
+def current_year_month_jst() -> str:
+    """JST基準の '%Y-%m' 文字列。月次集計のキーに使用"""
+    return datetime.datetime.now(jst).strftime("%Y-%m")
+
+
+def required_xp_for_level(level: int, coef: int = CONTRIBUTION_USER_LEVEL_COEF, exp: float = CONTRIBUTION_USER_LEVEL_EXP) -> int:
+    """指定レベルに到達するために必要な累積XP（Lv1は0XP）"""
+    if level <= 1:
+        return 0
+    return int(coef * (level ** exp))
+
+
+def level_from_xp(xp: int, coef: int = CONTRIBUTION_USER_LEVEL_COEF, exp: float = CONTRIBUTION_USER_LEVEL_EXP) -> int:
+    """累積XPからレベルを算出。Lv N 必要XP = coef * N^exp の逆算"""
+    if xp <= 0:
+        return 1
+    raw_level: float = (xp / coef) ** (1.0 / exp)
+    return max(1, int(raw_level))
+
+
+def add_contribution(discord_id: int, xp: int, vc_seconds: int, text_messages: int, last_text_at_iso: str | None = None) -> tuple[int, int]:
+    """totals と monthly に同時加算。組分け済みであることは呼び出し側で保証する。
+
+    返り値: (old_level, new_level) - 加算前後の個人レベル。Lvアップ判定に使う。
+    """
+    if xp == 0 and vc_seconds == 0 and text_messages == 0:
+        return (0, 0)
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ym: str = current_year_month_jst()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    # 加算前の累積XPを取得（Lvアップ判定用）
+    cur.execute("SELECT total_xp FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[int] | None = cur.fetchone()
+    old_xp: int = row[0] if row else 0
+    old_level: int = level_from_xp(old_xp)
+    # totals
+    cur.execute(
+        """
+        INSERT INTO contribution_totals (discord_id, total_xp, vc_seconds, text_messages, last_text_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(discord_id) DO UPDATE SET
+            total_xp = total_xp + excluded.total_xp,
+            vc_seconds = vc_seconds + excluded.vc_seconds,
+            text_messages = text_messages + excluded.text_messages,
+            last_text_at = COALESCE(excluded.last_text_at, contribution_totals.last_text_at),
+            updated_at = excluded.updated_at
+        """,
+        (discord_id, xp, vc_seconds, text_messages, last_text_at_iso, now_iso),
+    )
+    # monthly
+    cur.execute(
+        """
+        INSERT INTO contribution_monthly (year_month, discord_id, points, vc_seconds, text_messages)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(year_month, discord_id) DO UPDATE SET
+            points = points + excluded.points,
+            vc_seconds = vc_seconds + excluded.vc_seconds,
+            text_messages = text_messages + excluded.text_messages
+        """,
+        (ym, discord_id, xp, vc_seconds, text_messages),
+    )
+    con.commit()
+    con.close()
+    new_level: int = level_from_xp(old_xp + xp)
+    return (old_level, new_level)
+
+
+def get_user_house_id(discord_id: int) -> str | None:
+    """sorting_hat から所属寮IDを取得"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def get_house_channel_id(house_id: str, channel_type: str) -> int | None:
+    """house_channels から指定寮・チャンネル種別のIDを取得"""
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "SELECT channel_id FROM house_channels WHERE house_id = ? AND channel_type = ?",
+        (house_id, channel_type),
+    )
+    row: tuple[int] | None = cur.fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+async def notify_level_up(discord_id: int, old_level: int, new_level: int) -> None:
+    """所属寮の リーダーボード チャンネルに Lvアップ祝福を投稿する。
+    1Lv上昇でも 2Lv以上上昇でも一回だけ最終Lvを祝う（連続Lvアップは合算表現）。
+    """
+    if new_level <= old_level:
+        return
+    house_id: str | None = get_user_house_id(discord_id)
+    if house_id is None:
+        return
+    channel_id: int | None = get_house_channel_id(house_id, "leaderboard")
+    if channel_id is None:
+        return
+    channel: discord.abc.GuildChannel | None = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    house_info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_id), None)
+    house_emoji: str = house_info[2] if house_info else "🏰"
+    house_name_jp: str = house_info[1] if house_info else "?"
+
+    # 次Lvまでの必要XP
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT total_xp FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[int] | None = cur.fetchone()
+    con.close()
+    total_xp: int = row[0] if row else 0
+    next_required: int = required_xp_for_level(new_level + 1)
+    cur_required: int = required_xp_for_level(new_level)
+    remaining: int = max(0, next_required - total_xp)
+    in_lv: int = max(0, total_xp - cur_required)
+    span: int = max(1, next_required - cur_required)
+
+    title: str = "🎉 Lv UP!"
+    if new_level - old_level >= 2:
+        title = f"🎉🎉 {new_level - old_level}連Lv UP!"
+
+    # 個人ページURL（display_name 経由）。失敗時はトップにフォールバック
+    user_page_url: str = "https://pubview-dashboard.pages.dev/"
+    try:
+        guild_for_member: discord.Guild | None = bot.get_guild(DISCORD_GUILD_ID)
+        member_obj: discord.Member | None = None
+        if guild_for_member is not None:
+            member_obj = guild_for_member.get_member(discord_id)
+            if member_obj is None:
+                member_obj = await guild_for_member.fetch_member(discord_id)
+        if member_obj is not None:
+            import urllib.parse as _up
+            user_page_url = f"https://pubview-dashboard.pages.dev/u/{_up.quote(member_obj.display_name, safe='')}"
+    except Exception:
+        pass
+
+    embed: discord.Embed = discord.Embed(
+        title=title,
+        url=user_page_url,
+        description=f"<@{discord_id}> さんが **Lv {new_level}** に到達しました！",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="所属", value=f"{house_emoji} {house_name_jp}", inline=True)
+    embed.add_field(name="現在", value=f"Lv {new_level}", inline=True)
+    embed.add_field(name=f"次Lv {new_level + 1} まで", value=f"あと **{remaining:,} XP**（{in_lv:,}/{span:,}）", inline=False)
+    embed.add_field(name="​", value=f"[📊 ダッシュボードで詳細を見る →]({user_page_url})", inline=False)
+    try:
+        await channel.send(
+            embed=embed,
+            # 個人メンションは embed の description 内に <@id> として含めて発火させる
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[discord.Object(id=discord_id)]),
+        )
+    except Exception as e:
+        print(f"!!! notify_level_up: failed to send to channel {channel_id}: {e}")
+
+
+def vc_session_start(discord_id: int, channel_id: int) -> None:
+    """VC参加を記録。組分け済みのみ実行する想定（呼び出し側でフィルタ）"""
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO vc_sessions (discord_id, channel_id, joined_at) VALUES (?, ?, ?)",
+        (discord_id, channel_id, now_iso),
+    )
+    con.commit()
+    con.close()
+
+
+def vc_session_end(discord_id: int) -> tuple[int, int]:
+    """VC退出時に在室秒数を確定し、totals/monthly へ加算。
+
+    返り値: (old_level, new_level) - Lvアップ判定用。何も加算されなかった場合は (0, 0)。
+    """
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT joined_at FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    if not row:
+        con.close()
+        return (0, 0)
+    try:
+        joined_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+    except ValueError:
+        cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+        con.commit()
+        con.close()
+        return (0, 0)
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    seconds: int = max(0, int((now_utc - joined_at).total_seconds()))
+    cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    con.commit()
+    con.close()
+    if seconds <= 0:
+        return (0, 0)
+    # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
+    added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
+    return add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
 # -----------------------------
 
 # --- Botの初期設定 ---
@@ -584,6 +895,19 @@ async def on_ready() -> None:
 
     # Bot起動時に永続Viewを登録
     bot.add_view(DashboardView())
+
+    # --- コントリビューション: 起動時のVC在室者スキャン ---
+    # 再起動を跨いで在室している組分け済みメンバーを vc_sessions に再登録する
+    # （再起動中の時間はロストする。今この瞬間からの計測再開）
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            for vc_member in vc.members:
+                if vc_member.bot:
+                    continue
+                if is_sorted(vc_member.id):
+                    vc_session_start(vc_member.id, vc.id)
+    print("--- VC sessions re-initialized for sorted members ---")
+
     # 起動時ランキング速報は一旦停止（再開する場合は下記ブロックを有効化）
     # print("--- Posting initial ranking on startup ---")
     # channel: discord.TextChannel | discord.VoiceChannel | discord.Thread | None = bot.get_channel(NOTIFICATION_CHANNEL_ID)
@@ -594,6 +918,30 @@ async def on_ready() -> None:
 
     if not check_ranks_periodically.is_running():
         check_ranks_periodically.start()
+    if not weekly_digest_task.is_running():
+        weekly_digest_task.start()
+    if not monthly_summary_task.is_running():
+        monthly_summary_task.start()
+    if not daily_snapshot_task.is_running():
+        daily_snapshot_task.start()
+    # 起動時、今日のスナップショットが無ければ取る（個人ページのグラフが初回から表示できるように）
+    try:
+        today_jst: datetime.date = datetime.datetime.now(jst).date()
+        _con_ds: sqlite3.Connection = sqlite3.connect(DB_PATH)
+        _cur_ds: sqlite3.Cursor = _con_ds.cursor()
+        _cur_ds.execute("SELECT COUNT(*) FROM daily_snapshots WHERE snapshot_date = ?", (today_jst.isoformat(),))
+        _exists: int = _cur_ds.fetchone()[0]
+        _con_ds.close()
+        if _exists == 0:
+            save_daily_snapshot(today_jst)
+            print(f"--- daily_snapshot bootstrap for {today_jst.isoformat()} ---")
+    except Exception as e:
+        print(f"!!! daily_snapshot bootstrap failed: {e}")
+    if CLOUDFLARE_INGEST_URL and INGEST_TOKEN and not sync_to_d1_task.is_running():
+        sync_to_d1_task.start()
+        print("--- D1 sync task started (5min interval) ---")
+    elif not (CLOUDFLARE_INGEST_URL and INGEST_TOKEN):
+        print("--- D1 sync task SKIPPED: CLOUDFLARE_INGEST_URL / INGEST_TOKEN not set ---")
 
 # --- コマンド ---
 @bot.slash_command(name="register", description="あなたのRiot IDをボットに登録します。", guild_ids=[DISCORD_GUILD_ID])
@@ -684,6 +1032,264 @@ async def unregister(ctx: discord.ApplicationContext) -> None:
     except Exception as e:
         await ctx.respond("登録解除中に予期せぬエラーが発生しました。")
 
+@bot.slash_command(name="score", description="あなたの貢献度・レベル・今月のポイントを表示します。", guild_ids=[DISCORD_GUILD_ID])
+async def score(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    discord_id: int = ctx.author.id
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (discord_id,))
+    house_row: tuple[str] | None = cur.fetchone()
+    if not house_row:
+        con.close()
+        await ctx.respond(
+            "まだ組分け帽子を被っていません。ダッシュボードから組分けすると貢献度が貯まり始めます。",
+            ephemeral=True,
+        )
+        return
+    house_info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_row[0]), None)
+
+    cur.execute(
+        "SELECT total_xp, vc_seconds, text_messages FROM contribution_totals WHERE discord_id = ?",
+        (discord_id,),
+    )
+    totals_row: tuple[int, int, int] | None = cur.fetchone()
+    total_xp: int = totals_row[0] if totals_row else 0
+    vc_seconds: int = totals_row[1] if totals_row else 0
+    text_messages: int = totals_row[2] if totals_row else 0
+
+    ym: str = current_year_month_jst()
+    cur.execute(
+        "SELECT points, vc_seconds, text_messages FROM contribution_monthly WHERE year_month = ? AND discord_id = ?",
+        (ym, discord_id),
+    )
+    monthly_row: tuple[int, int, int] | None = cur.fetchone()
+    monthly_pt: int = monthly_row[0] if monthly_row else 0
+    monthly_vc: int = monthly_row[1] if monthly_row else 0
+    monthly_text: int = monthly_row[2] if monthly_row else 0
+    con.close()
+
+    level: int = level_from_xp(total_xp)
+    current_level_xp: int = required_xp_for_level(level)
+    next_level_xp: int = required_xp_for_level(level + 1)
+    xp_into_current: int = total_xp - current_level_xp
+    xp_needed: int = next_level_xp - current_level_xp
+
+    embed: discord.Embed = discord.Embed(
+        title=f"📊 {ctx.author.display_name} の貢献度",
+        color=discord.Color.blurple(),
+    )
+    if house_info:
+        embed.add_field(name="所属", value=f"{house_info[2]} {house_info[1]}", inline=False)
+    embed.add_field(name="個人レベル", value=f"Lv {level}", inline=True)
+    embed.add_field(name="累積XP", value=f"{total_xp:,}", inline=True)
+    embed.add_field(name="次Lvまで", value=f"{xp_into_current:,} / {xp_needed:,} XP", inline=True)
+    embed.add_field(
+        name=f"今月（{ym}）",
+        value=(
+            f"**{monthly_pt:,} pt**\n"
+            f"VC {monthly_vc // 3600}時間{(monthly_vc % 3600) // 60}分 / "
+            f"投稿 {monthly_text:,}件"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="累積アクティビティ",
+        value=(
+            f"VC {vc_seconds // 3600}時間{(vc_seconds % 3600) // 60}分 / "
+            f"投稿 {text_messages:,}件"
+        ),
+        inline=False,
+    )
+    await ctx.respond(embed=embed, ephemeral=True)
+
+
+# --- /leaderboard / /house_standings: 貢献度ランキング系 ---
+HOUSE_BY_ID: dict[str, tuple[str, str, str, str]] = {h[0]: h for h in HOUSES}
+
+
+def _house_emoji(house_id: str) -> str:
+    h: tuple[str, str, str, str] | None = HOUSE_BY_ID.get(house_id)
+    return h[2] if h else "❔"
+
+
+def _house_name(house_id: str) -> str:
+    h: tuple[str, str, str, str] | None = HOUSE_BY_ID.get(house_id)
+    return h[1] if h else "?"
+
+
+def _fmt_int(n: int) -> str:
+    return f"{n:,}"
+
+
+@bot.slash_command(
+    name="leaderboard",
+    description="個人のコントリビューションランキング（Top10）を表示します。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+async def leaderboard(
+    ctx: discord.ApplicationContext,
+    mode: discord.Option(  # type: ignore[valid-type]
+        str,
+        "並び替え基準",
+        choices=["monthly", "total"],
+        default="monthly",
+    ),
+) -> None:
+    """組分け済みメンバーの貢献度Top10。mode=monthly: 今月pt順 / mode=total: 累積XP順"""
+    await ctx.defer()
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    ym: str = current_year_month_jst()
+
+    if mode == "total":
+        cur.execute(
+            """
+            SELECT s.discord_id, s.house_id,
+                   COALESCE(t.total_xp, 0)   AS total_xp,
+                   COALESCE(m.points, 0)     AS month_pt
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+            LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+            ORDER BY total_xp DESC
+            LIMIT 10
+            """,
+            (ym,),
+        )
+        title: str = "🏆 累積XPランキング（Top 10）"
+        primary_label: str = "XP"
+    else:
+        cur.execute(
+            """
+            SELECT s.discord_id, s.house_id,
+                   COALESCE(t.total_xp, 0)   AS total_xp,
+                   COALESCE(m.points, 0)     AS month_pt
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+            LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+            ORDER BY month_pt DESC, total_xp DESC
+            LIMIT 10
+            """,
+            (ym,),
+        )
+        title: str = f"🏆 今月の貢献度ランキング（{ym} / Top 10）"
+        primary_label: str = "pt"
+
+    rows: list[tuple[int, str, int, int]] = cur.fetchall()
+    con.close()
+
+    embed: discord.Embed = discord.Embed(title=title, color=discord.Color.gold())
+    if not rows:
+        embed.description = "まだ組分けされたメンバーがいないか、貢献度の記録がありません。"
+        await ctx.respond(embed=embed)
+        return
+
+    lines: list[str] = []
+    guild: discord.Guild | None = ctx.guild
+    for i, (discord_id, house_id, total_xp, month_pt) in enumerate(rows, start=1):
+        member_name: str = f"<@{discord_id}>"
+        # ユーザー削除済みのフォールバック
+        if guild is not None:
+            member: discord.Member | None = guild.get_member(discord_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(discord_id)
+                except Exception:
+                    member = None
+            if member is not None:
+                member_name = member.mention
+        lv: int = level_from_xp(total_xp)
+        value: int = total_xp if mode == "total" else month_pt
+        lines.append(
+            f"`#{i:>2}` {_house_emoji(house_id)} {member_name} ・ Lv {lv} ・ **{_fmt_int(value)} {primary_label}**"
+        )
+
+    dashboard_lb_url: str = f"https://pubview-dashboard.pages.dev/leaderboard?mode={mode}"
+    embed.description = "\n".join(lines)
+    embed.url = dashboard_lb_url
+    embed.add_field(
+        name="​",
+        value=f"[📊 Webダッシュボードのランキングを開く →]({dashboard_lb_url})",
+        inline=False,
+    )
+    embed.set_footer(text="mode=total: 累積XP順 / mode=monthly: 今月pt順")
+    await ctx.respond(embed=embed)
+
+
+@bot.slash_command(
+    name="house_standings",
+    description="4寮のコントリビューション対抗状況を表示します。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+async def house_standings(ctx: discord.ApplicationContext) -> None:
+    """寮ごとの 寮Lv / 累積XP / 今月pt / メンバー数 を1枚で表示。"""
+    await ctx.defer()
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    ym: str = current_year_month_jst()
+
+    cur.execute(
+        """
+        SELECT s.house_id,
+               COUNT(DISTINCT s.discord_id)   AS member_count,
+               COALESCE(SUM(t.total_xp), 0)    AS total_xp,
+               COALESCE(SUM(m.points),  0)    AS month_pt
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals  t ON s.discord_id = t.discord_id
+        LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+        GROUP BY s.house_id
+        """,
+        (ym,),
+    )
+    stats_by_house: dict[str, tuple[int, int, int]] = {
+        row[0]: (row[1], row[2], row[3]) for row in cur.fetchall()
+    }
+    con.close()
+
+    embed: discord.Embed = discord.Embed(
+        title=f"🏰 寮対抗スタンディング（{ym}）",
+        color=discord.Color.dark_purple(),
+    )
+
+    # 寮Lv 順、同点は今月pt降順
+    ordered: list[tuple[str, int, int, int, int]] = []
+    for house_id, name_jp, emoji, _role in HOUSES:
+        member_count, total_xp, month_pt = stats_by_house.get(house_id, (0, 0, 0))
+        house_lv: int = level_from_xp(total_xp, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        ordered.append((house_id, member_count, total_xp, month_pt, house_lv))
+    ordered.sort(key=lambda x: (-x[4], -x[3]))
+
+    for i, (house_id, member_count, total_xp, month_pt, house_lv) in enumerate(ordered, start=1):
+        h_name: str = _house_name(house_id)
+        h_emoji: str = _house_emoji(house_id)
+        cur_xp: int = required_xp_for_level(house_lv, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        next_xp: int = required_xp_for_level(house_lv + 1, CONTRIBUTION_HOUSE_LEVEL_COEF, CONTRIBUTION_HOUSE_LEVEL_EXP)
+        in_lv: int = total_xp - cur_xp
+        span: int = max(1, next_xp - cur_xp)
+        bar_filled: int = max(0, min(10, round((in_lv / span) * 10)))
+        bar: str = "▰" * bar_filled + "▱" * (10 - bar_filled)
+        embed.add_field(
+            name=f"`#{i}` {h_emoji} {h_name}  ・ 寮Lv {house_lv}",
+            value=(
+                f"{bar} {_fmt_int(in_lv)}/{_fmt_int(next_xp - cur_xp)} XP\n"
+                f"累積 **{_fmt_int(total_xp)} XP** ・ 今月 **{_fmt_int(month_pt)} pt** ・ メンバー {member_count}人"
+            ),
+            inline=False,
+        )
+
+    embed.url = "https://pubview-dashboard.pages.dev/"
+    embed.add_field(
+        name="​",
+        value="[📊 Webダッシュボードを開く →](https://pubview-dashboard.pages.dev/)",
+        inline=False,
+    )
+    await ctx.respond(embed=embed)
+# -----------------------------
+
+
 @bot.slash_command(name="ranking", description="サーバー内のLoLランクランキングを表示します。", guild_ids=[DISCORD_GUILD_ID])
 async def ranking(ctx: discord.ApplicationContext) -> None:
     await ctx.defer()
@@ -722,6 +1328,209 @@ async def dashboard(ctx: discord.ApplicationContext, channel: discord.TextChanne
 
     await target_channel.send(embed=embed, view=DashboardView())
     await ctx.respond("ダッシュボードを送信しました。", ephemeral=True)
+
+@bot.slash_command(name="setup_house_channels", description="4寮ぶんのカテゴリ・チャンネルを一括作成します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
+@discord.default_permissions(administrator=True)
+async def setup_house_channels(ctx: discord.ApplicationContext) -> None:
+    """寮ごとのカテゴリと配下チャンネル（雑談/リーダーボード/VC）を一括作成する。
+
+    権限設計:
+      - カテゴリ: @everyone view denied / 寮ロール view allowed
+      - 雑談 / VC: カテゴリから継承
+      - リーダーボード: カテゴリから継承 + 寮ロール send_messages denied（Botのみ投稿可）
+
+    idempotent: 既に作成済みのチャンネルがあればスキップ、無いものだけ作る。
+    作成結果は house_channels テーブルに記録する。
+    """
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    me: discord.Member | None = guild.me
+    bot_member: discord.Member = me if me is not None else await guild.fetch_member(bot.user.id)
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    summary_lines: list[str] = []
+
+    for house_id, house_name_jp, house_emoji, role_name in HOUSES:
+        house_role: discord.Role | None = discord.utils.get(guild.roles, name=role_name)
+        if house_role is None:
+            summary_lines.append(f"⚠️ {house_emoji} {house_name_jp}: ロール「{role_name}」が見つかりません。先にロール作成が必要。")
+            continue
+
+        # カテゴリ権限: @everyone view denied / 寮ロール view allowed / Bot view allowed
+        category_overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            house_role:          discord.PermissionOverwrite(view_channel=True, connect=True),
+            bot_member:          discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, connect=True),
+        }
+
+        category_name: str = f"{house_emoji}｜{house_name_jp}"
+        category: discord.CategoryChannel | None = discord.utils.get(guild.categories, name=category_name)
+        category_created: bool = False
+        if category is None:
+            try:
+                category = await guild.create_category(name=category_name, overwrites=category_overwrites, reason=f"setup_house_channels: {house_id}")
+                category_created = True
+            except Exception as e:
+                summary_lines.append(f"❌ {house_emoji} {house_name_jp}: カテゴリ作成失敗 ({e})")
+                continue
+        else:
+            # 既存カテゴリの権限を念のため上書き（誤設定リカバリ）
+            try:
+                for target, ow in category_overwrites.items():
+                    await category.set_permissions(target, overwrite=ow, reason="setup_house_channels: enforce overwrites")
+            except Exception as e:
+                print(f"!!! setup_house_channels: failed to enforce category overwrites for {house_id}: {e}")
+
+        cur.execute(
+            "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+            (house_id, "category", category.id, now_iso),
+        )
+
+        # 配下チャンネル定義: (channel_type, name, kind, extra_overwrites)
+        # kind: "text" | "voice"
+        # extra_overwrites: リーダーボードは寮ロールに send_messages = False を上書き
+        chat_name: str = "雑談"
+        board_name: str = "リーダーボード"
+        vc_name: str = f"{house_name_jp}VC"
+
+        # リーダーボード用 overwrite（カテゴリ継承 + 寮ロールの send 拒否）
+        board_overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            house_role:          discord.PermissionOverwrite(view_channel=True, send_messages=False, add_reactions=True),
+            bot_member:          discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True),
+        }
+
+        sub_channels: list[tuple[str, str, str, dict[discord.Role | discord.Member, discord.PermissionOverwrite] | None]] = [
+            ("chat",        chat_name,  "text",  None),
+            ("leaderboard", board_name, "text",  board_overwrites),
+            ("vc",          vc_name,    "voice", None),
+        ]
+
+        for channel_type, name, kind, extra_ow in sub_channels:
+            existing: discord.abc.GuildChannel | None
+            if kind == "text":
+                existing = discord.utils.get(category.text_channels, name=name)
+            else:
+                existing = discord.utils.get(category.voice_channels, name=name)
+            if existing is not None:
+                cur.execute(
+                    "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+                    (house_id, channel_type, existing.id, now_iso),
+                )
+                continue
+            try:
+                if kind == "text":
+                    created = await guild.create_text_channel(
+                        name=name, category=category,
+                        overwrites=extra_ow if extra_ow is not None else category_overwrites,
+                        reason=f"setup_house_channels: {house_id}/{channel_type}",
+                    )
+                else:
+                    created = await guild.create_voice_channel(
+                        name=name, category=category, user_limit=0,
+                        reason=f"setup_house_channels: {house_id}/{channel_type}",
+                    )
+                cur.execute(
+                    "INSERT OR REPLACE INTO house_channels (house_id, channel_type, channel_id, created_at) VALUES (?, ?, ?, ?)",
+                    (house_id, channel_type, created.id, now_iso),
+                )
+            except Exception as e:
+                summary_lines.append(f"❌ {house_emoji} {house_name_jp}/{name}: 作成失敗 ({e})")
+
+        summary_lines.append(
+            f"{'🆕' if category_created else '♻️'} {house_emoji} {house_name_jp}: カテゴリ + 雑談 + リーダーボード + VC OK"
+        )
+
+    con.commit()
+    con.close()
+
+    msg: str = "**寮チャンネルセットアップ完了**\n" + "\n".join(summary_lines)
+    await ctx.respond(msg, ephemeral=True)
+
+
+@bot.slash_command(
+    name="set_house_leader",
+    description="指定ユーザーをその寮の寮長に任命します。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def set_house_leader(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮",
+        choices=["raptor", "krug", "wolf", "gromp"],
+    ),
+    user: discord.Member,
+) -> None:
+    """対象ユーザーを寮長に任命。対象は同寮所属のメンバーであることを推奨（ただし制約はかけない）。"""
+    await ctx.defer(ephemeral=True)
+    user_house: str | None = get_user_house_id(user.id)
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house), None)
+    if info is None:
+        await ctx.respond(f"unknown house: {house}", ephemeral=True)
+        return
+    now_iso: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        "INSERT OR REPLACE INTO house_leaders (house_id, discord_id, set_at, set_by) VALUES (?, ?, ?, ?)",
+        (house, user.id, now_iso, ctx.author.id),
+    )
+    con.commit()
+    con.close()
+    warn: str = ""
+    if user_house is None:
+        warn = "\n⚠️ 対象ユーザーはまだ組分け帽子を被っていません。"
+    elif user_house != house:
+        warn = f"\n⚠️ 対象ユーザーは別の寮 ({_house_name(user_house)}) に所属しています。"
+    await ctx.respond(
+        f"✅ {info[2]} {info[1]} の寮長に {user.mention} を任命しました。{warn}\n"
+        "次回 D1 同期 (5分以内) でダッシュボードに反映されます。",
+        ephemeral=True,
+    )
+
+
+@bot.slash_command(
+    name="clear_house_leader",
+    description="指定寮の寮長任命を解除します。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def clear_house_leader(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮",
+        choices=["raptor", "krug", "wolf", "gromp"],
+    ),
+) -> None:
+    await ctx.defer(ephemeral=True)
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house), None)
+    if info is None:
+        await ctx.respond(f"unknown house: {house}", ephemeral=True)
+        return
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("DELETE FROM house_leaders WHERE house_id = ?", (house,))
+    changed: int = cur.rowcount
+    con.commit()
+    con.close()
+    if changed == 0:
+        await ctx.respond(f"{info[2]} {info[1]} には寮長が任命されていません。", ephemeral=True)
+    else:
+        await ctx.respond(
+            f"✅ {info[2]} {info[1]} の寮長任命を解除しました。次回 D1 同期で反映されます。",
+            ephemeral=True,
+        )
+
 
 @bot.slash_command(name="add_section", description="参加可能なセクションを登録します。（管理者向け）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
@@ -789,6 +1598,58 @@ async def remove_user_from_section(ctx: discord.ApplicationContext, user: discor
 
 
 # --- デバッグ用コマンド ---
+@bot.slash_command(
+    name="setup_dev_channel",
+    description="開発者用のテストチャンネルを作成します（実行者と Bot のみ閲覧可）。",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def setup_dev_channel(
+    ctx: discord.ApplicationContext,
+    channel_name: discord.Option(str, "作成するチャンネル名", default="🧪｜bot-test"),  # type: ignore[valid-type]
+) -> None:
+    """テスト用のプライベートチャンネルを作成する。
+
+    権限: @everyone view denied / 実行者 view+send allow / Bot view+send+manage allow
+    既存があればそのまま流用してIDだけ返す（idempotent）。
+    """
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    existing: discord.TextChannel | None = discord.utils.get(guild.text_channels, name=channel_name)
+    if existing is not None:
+        await ctx.respond(
+            f"既に同名のチャンネルが存在します: {existing.mention} (ID: `{existing.id}`)",
+            ephemeral=True,
+        )
+        return
+
+    me: discord.Member = guild.me if guild.me is not None else await guild.fetch_member(bot.user.id)
+    author: discord.User | discord.Member = ctx.author
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        author:             discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        me:                 discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=True, manage_channels=True),
+    }
+    try:
+        created: discord.TextChannel = await guild.create_text_channel(
+            name=channel_name,
+            overwrites=overwrites,
+            reason=f"setup_dev_channel by {author}",
+        )
+    except Exception as e:
+        await ctx.respond(f"作成失敗: `{e}`", ephemeral=True)
+        return
+    await ctx.respond(
+        f"✅ テストチャンネル {created.mention} を作成しました（ID: `{created.id}`）。\n"
+        "あなたと Bot のみ閲覧可能です。他の管理者を追加したい場合は手動で permission を編集してください。",
+        ephemeral=True,
+    )
+
+
 @bot.slash_command(name="debug_check_ranks_periodically", description="定期的なランクチェックを手動で実行します。（デバッグ用）", guild_ids=[DISCORD_GUILD_ID])
 @discord.default_permissions(administrator=True)
 async def debug_check_ranks_periodically(ctx: discord.ApplicationContext) -> None:
@@ -845,8 +1706,570 @@ async def debug_modify_rank(ctx: discord.ApplicationContext, user: discord.Membe
     except Exception as e:
         await ctx.respond(f"処理中にエラーが発生しました: {e}")
 
+
+@bot.slash_command(
+    name="debug_grant_xp",
+    description="指定ユーザーにXPを付与してLvアップを強制発火させます。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_grant_xp(
+    ctx: discord.ApplicationContext,
+    user: discord.Member,
+    amount: int,
+) -> None:
+    """組分け済みユーザーに任意のXPを加算する。Lvが上がれば祝福通知も発火する。"""
+    await ctx.defer(ephemeral=True)
+    if not is_sorted(user.id):
+        await ctx.respond(f"{user.display_name} はまだ組分け帽子を被っていません。", ephemeral=True)
+        return
+    if amount == 0:
+        await ctx.respond("amount は 0 以外を指定してください。", ephemeral=True)
+        return
+    old_level, new_level = add_contribution(user.id, xp=amount, vc_seconds=0, text_messages=0)
+    msg: str = f"✅ {user.display_name} に {amount:+,} XP 加算しました（Lv {old_level} → Lv {new_level}）。"
+    if new_level > old_level:
+        msg += " Lvアップ通知が所属寮のリーダーボードに投稿されます。"
+        await notify_level_up(user.id, old_level, new_level)
+    await ctx.respond(msg, ephemeral=True)
+
+
+# --- 週次ダイジェスト / 月次サマリ ---
+DASHBOARD_URL: str = "https://pubview-dashboard.pages.dev/"
+
+
+def _bar10(progress: float) -> str:
+    """0.0〜1.0 を10段階のバー文字列に。"""
+    filled: int = max(0, min(10, round(progress * 10)))
+    return "▰" * filled + "▱" * (10 - filled)
+
+
+def _this_jst_monday(now_jst: datetime.datetime | None = None) -> datetime.date:
+    """今週月曜日のJST日付（土曜だったら今週月曜＝5日前）。"""
+    if now_jst is None:
+        now_jst = datetime.datetime.now(jst)
+    return (now_jst.date() - datetime.timedelta(days=now_jst.weekday()))
+
+
+def save_weekly_snapshot(snapshot_date: datetime.date) -> int:
+    """全組分け済みメンバーの現在累積をスナップショット保存。書き込んだ行数を返す。"""
+    iso_date: str = snapshot_date.isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO weekly_snapshots (snapshot_date, discord_id, total_xp, vc_seconds, text_messages)
+        SELECT ?, s.discord_id,
+               COALESCE(t.total_xp, 0),
+               COALESCE(t.vc_seconds, 0),
+               COALESCE(t.text_messages, 0)
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        """,
+        (iso_date,),
+    )
+    written: int = cur.rowcount
+    con.commit()
+    con.close()
+    return written
+
+
+def save_daily_snapshot(snapshot_date: datetime.date) -> int:
+    """全組分け済みメンバーの現在累積を日次スナップショットへ保存。"""
+    iso_date: str = snapshot_date.isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO daily_snapshots (snapshot_date, discord_id, total_xp, vc_seconds, text_messages)
+        SELECT ?, s.discord_id,
+               COALESCE(t.total_xp, 0),
+               COALESCE(t.vc_seconds, 0),
+               COALESCE(t.text_messages, 0)
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        """,
+        (iso_date,),
+    )
+    written: int = cur.rowcount
+    con.commit()
+    con.close()
+    return written
+
+
+async def post_weekly_digest_for_house(house_id: str) -> str:
+    """指定寮の週次ダイジェストを 該当寮 リーダーボード へ投稿。
+
+    返り値: 結果サマリ文字列（デバッグコマンドが拾って表示）。
+    """
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house_id), None)
+    if info is None:
+        return f"unknown house: {house_id}"
+    _, house_name_jp, house_emoji, _ = info
+
+    channel_id: int | None = get_house_channel_id(house_id, "leaderboard")
+    if channel_id is None:
+        return f"no leaderboard channel registered for {house_id}"
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return f"channel {channel_id} not text channel"
+
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    this_monday: datetime.date = _this_jst_monday(now_jst)
+    last_monday: datetime.date = this_monday - datetime.timedelta(days=7)
+    this_sunday: datetime.date = this_monday + datetime.timedelta(days=6)
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    # 寮メンバー + 現在の累積 + 先週のスナップショット
+    cur.execute(
+        """
+        SELECT s.discord_id,
+               COALESCE(t.total_xp,     0) AS total_xp,
+               COALESCE(t.vc_seconds,   0) AS vc_seconds,
+               COALESCE(t.text_messages,0) AS text_messages,
+               COALESCE(ws.total_xp,    0) AS prev_xp,
+               COALESCE(ws.vc_seconds,  0) AS prev_vc,
+               COALESCE(ws.text_messages,0) AS prev_text,
+               (ws.discord_id IS NOT NULL) AS has_prev
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+        WHERE s.house_id = ?
+        """,
+        (last_monday.isoformat(), house_id),
+    )
+    rows: list[tuple[int, int, int, int, int, int, int, int]] = cur.fetchall()
+    con.close()
+
+    if not rows:
+        try:
+            await channel.send(f"今週のダイジェスト: {house_emoji} {house_name_jp} はまだメンバーがいません。")
+        except Exception as e:
+            return f"send failed: {e}"
+        return f"{house_id}: no members"
+
+    has_baseline: bool = any(r[7] for r in rows)
+    members: list[dict[str, Any]] = []
+    for did, total_xp, vc_sec, txt, prev_xp, prev_vc, prev_text, has_prev in rows:
+        gained_xp: int = total_xp - prev_xp if has_prev else 0  # 初回はゼロ表示（先週比なし）
+        gained_vc: int = vc_sec - prev_vc if has_prev else 0
+        gained_text: int = txt - prev_text if has_prev else 0
+        members.append({
+            "discord_id": did,
+            "total_xp": total_xp,
+            "gained_xp": gained_xp,
+            "gained_vc": gained_vc,
+            "gained_text": gained_text,
+            "level": level_from_xp(total_xp),
+        })
+
+    members.sort(key=lambda m: m["gained_xp"], reverse=True)
+
+    house_gained: int = sum(m["gained_xp"] for m in members)
+    active_count: int = sum(1 for m in members if m["gained_xp"] > 0)
+    member_count: int = len(members)
+    total_vc: int = sum(m["gained_vc"] for m in members)
+    total_text: int = sum(m["gained_text"] for m in members)
+
+    # KPIs
+    kpi_lines: list[str] = [
+        f"├ 今週の獲得pt: **+{house_gained:,} pt**",
+        f"├ 参加メンバー: **{active_count}/{member_count}** ({(active_count/max(1,member_count)*100):.1f}%)",
+        f"├ VC在室時間: **{total_vc//3600}h {(total_vc%3600)//60}m**",
+        f"└ テキスト投稿: **{total_text:,}件**",
+    ]
+
+    # トップコントリビューター（上位5）
+    top_lines: list[str] = []
+    for i, m in enumerate(members[:5], start=1):
+        lv: int = m["level"]
+        cur_xp: int = required_xp_for_level(lv)
+        next_xp: int = required_xp_for_level(lv + 1)
+        in_lv: int = m["total_xp"] - cur_xp
+        span: int = max(1, next_xp - cur_xp)
+        share: float = (m["gained_xp"] / house_gained * 100) if house_gained > 0 else 0.0
+        bar: str = _bar10(in_lv / span)
+        top_lines.append(
+            f"<@{m['discord_id']}> **Lv.{lv}** ({in_lv:,}/{span:,} XP)\n"
+            f"{bar} **+{m['gained_xp']:,} pt** ({share:.1f}%)"
+        )
+
+    # 寮間順位算出
+    standings: list[tuple[str, int]] = []
+    con2: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur2: sqlite3.Cursor = con2.cursor()
+    for h in HOUSES:
+        cur2.execute(
+            """
+            SELECT COALESCE(SUM(t.total_xp - COALESCE(ws.total_xp, 0)), 0)
+            FROM sorting_hat s
+            LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+            LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+            WHERE s.house_id = ?
+            """,
+            (last_monday.isoformat(), h[0]),
+        )
+        result: tuple[int] = cur2.fetchone()
+        standings.append((h[0], result[0]))
+    con2.close()
+    standings.sort(key=lambda x: x[1], reverse=True)
+    rank: int = next((i for i, (hid, _) in enumerate(standings, start=1) if hid == house_id), 0)
+    rank_line: str = ""
+    if rank == 1 and len(standings) > 1:
+        runner_up_pt: int = standings[1][1]
+        rank_line = f"🏃 順位: **4寮中 1位** / 2位{HOUSE_BY_ID[standings[1][0]][1]}との差 +{house_gained - runner_up_pt:,} pt"
+    elif rank >= 2:
+        leader_pt: int = standings[0][1]
+        rank_line = f"🏃 順位: 4寮中 {rank}位 / 1位{HOUSE_BY_ID[standings[0][0]][1]}まで +{leader_pt - house_gained:,} pt"
+
+    desc: str = "\n".join(kpi_lines)
+    house_page_url: str = f"https://pubview-dashboard.pages.dev/houses/{house_id}"
+    embed: discord.Embed = discord.Embed(
+        title=f"{house_emoji} {house_name_jp} 週次ダイジェスト",
+        url=house_page_url,
+        description=(
+            f"📅 {this_monday.strftime('%Y年%m月%d日')} 〜 {this_sunday.strftime('%Y年%m月%d日')}\n\n"
+            f"📊 主要指標 (KPIs)\n{desc}"
+        ),
+        color=discord.Color.dark_purple(),
+    )
+    if not has_baseline:
+        embed.add_field(name="📌 注記", value="初回計測（先週比なし）", inline=False)
+    if top_lines:
+        embed.add_field(name="🏆 トップコントリビューター", value="\n\n".join(top_lines)[:1024], inline=False)
+    if rank_line:
+        embed.add_field(name="📈 トレンド", value=rank_line, inline=False)
+    embed.add_field(
+        name="​",
+        value=f"[📊 {house_name_jp} の寮ページを見る →]({house_page_url})",
+        inline=False,
+    )
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+        )
+    except Exception as e:
+        return f"send failed: {e}"
+    return f"{house_id}: posted ({house_gained:,} pt, {active_count}/{member_count} active)"
+
+
+async def post_weekly_digest_all() -> list[str]:
+    """4寮の週次ダイジェストを投稿し、最後に新スナップショットを保存。"""
+    summaries: list[str] = []
+    for h in HOUSES:
+        summary: str = await post_weekly_digest_for_house(h[0])
+        summaries.append(summary)
+    today: datetime.date = _this_jst_monday()
+    save_weekly_snapshot(today)
+    return summaries
+
+
+async def post_monthly_summary(year_month_override: str | None = None) -> str:
+    """月次サマリを NOTIFICATION_CHANNEL_ID へ投稿。
+
+    year_month_override が None の場合は「先月」を対象（毎月1日0:00発火想定）。
+    """
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if year_month_override is not None:
+        target_ym: str = year_month_override
+    else:
+        prev_month_last_day: datetime.date = now_jst.date().replace(day=1) - datetime.timedelta(days=1)
+        target_ym = prev_month_last_day.strftime("%Y-%m")
+
+    channel = bot.get_channel(NOTIFICATION_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        return f"NOTIFICATION_CHANNEL_ID {NOTIFICATION_CHANNEL_ID} not text channel"
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+
+    # 寮別合計
+    cur.execute(
+        """
+        SELECT s.house_id, COALESCE(SUM(m.points), 0) AS pt, COUNT(DISTINCT s.discord_id) AS members
+        FROM sorting_hat s
+        LEFT JOIN contribution_monthly m ON s.discord_id = m.discord_id AND m.year_month = ?
+        GROUP BY s.house_id
+        """,
+        (target_ym,),
+    )
+    house_rows: list[tuple[str, int, int]] = cur.fetchall()
+    house_rows.sort(key=lambda r: r[1], reverse=True)
+
+    # 個人MVP Top5
+    cur.execute(
+        """
+        SELECT m.discord_id, s.house_id, m.points
+        FROM contribution_monthly m
+        JOIN sorting_hat s ON m.discord_id = s.discord_id
+        WHERE m.year_month = ?
+        ORDER BY m.points DESC
+        LIMIT 5
+        """,
+        (target_ym,),
+    )
+    mvp_rows: list[tuple[int, str, int]] = cur.fetchall()
+    con.close()
+
+    medals: list[str] = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    house_lines: list[str] = []
+    for i, (house_id, pt, members) in enumerate(house_rows):
+        info: tuple[str, str, str, str] = HOUSE_BY_ID[house_id]
+        medal: str = medals[i] if i < len(medals) else f"{i+1}."
+        house_lines.append(f"{medal} {info[2]} {info[1]} — **{pt:,} pt** ({members}人)")
+    mvp_lines: list[str] = []
+    if mvp_rows:
+        for i, (did, hid, pt) in enumerate(mvp_rows, start=1):
+            house_emoji: str = HOUSE_BY_ID[hid][2]
+            mvp_lines.append(f"`#{i}` {house_emoji} <@{did}> — **{pt:,} pt**")
+
+    monthly_page_url: str = f"https://pubview-dashboard.pages.dev/monthly/{target_ym}"
+    embed: discord.Embed = discord.Embed(
+        title=f"📅 {target_ym} 月次サマリ",
+        url=monthly_page_url,
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="🏰 寮対抗ランキング",
+        value="\n".join(house_lines) if house_lines else "（記録なし）",
+        inline=False,
+    )
+    embed.add_field(
+        name="🌟 個人MVP Top 5",
+        value="\n".join(mvp_lines) if mvp_lines else "（記録なし）",
+        inline=False,
+    )
+    embed.add_field(
+        name="​",
+        value=f"[📊 {target_ym} のアーカイブを見る →]({monthly_page_url})",
+        inline=False,
+    )
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+        )
+    except Exception as e:
+        return f"send failed: {e}"
+    return f"posted monthly summary for {target_ym}"
+# -----------------------------
+
+
+# --- Bot → D1 同期 ---
+async def sync_to_d1() -> dict[str, Any]:
+    """Bot SQLite の全テーブルを取得して /api/ingest へ POST する。
+
+    返り値: {ok: bool, status, counts, error?}
+    """
+    if not CLOUDFLARE_INGEST_URL or not INGEST_TOKEN:
+        return {"ok": False, "error": "CLOUDFLARE_INGEST_URL / INGEST_TOKEN unset"}
+
+    guild: discord.Guild | None = bot.get_guild(DISCORD_GUILD_ID)
+    if guild is None:
+        return {"ok": False, "error": f"guild {DISCORD_GUILD_ID} not in cache"}
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+
+    # users: Bot DB の Riot 情報 + Discord プロフィール（display_name/avatar）を結合
+    cur.execute("SELECT discord_id, game_name, tag_line, tier, rank, league_points FROM users")
+    riot_users: dict[int, tuple[str | None, str | None, str | None, str | None, int | None]] = {
+        row[0]: (row[1], row[2], row[3], row[4], row[5]) for row in cur.fetchall()
+    }
+
+    # sorting_hat 配下の discord_id も含めて users 配列に入れる
+    cur.execute("SELECT discord_id FROM sorting_hat")
+    sorted_ids: set[int] = {row[0] for row in cur.fetchall()}
+    all_discord_ids: set[int] = set(riot_users.keys()) | sorted_ids
+    # house_leaders, contribution_totals/monthly に居るが他に無いユーザーもDiscordプロファイル必要
+    cur.execute("SELECT discord_id FROM contribution_totals")
+    for r in cur.fetchall(): all_discord_ids.add(r[0])
+    cur.execute("SELECT discord_id FROM house_leaders")
+    for r in cur.fetchall(): all_discord_ids.add(r[0])
+
+    users_payload: list[dict[str, Any]] = []
+    for did in all_discord_ids:
+        member: discord.Member | None = guild.get_member(did)
+        if member is None:
+            try:
+                member = await guild.fetch_member(did)
+            except Exception:
+                member = None
+        display_name: str = member.display_name if member is not None else f"user_{did}"
+        avatar_url: str | None = str(member.display_avatar.url) if member is not None else None
+        game_name, tag_line, tier, rank_, lp = riot_users.get(did, (None, None, None, None, None))
+        users_payload.append({
+            "discord_id": str(did),
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+            "riot_game_name": game_name,
+            "riot_tag_line": tag_line,
+            "tier": tier,
+            "rank": rank_,
+            "league_points": lp,
+        })
+
+    cur.execute("SELECT discord_id, house_id, rate_bracket, tier, sorted_at FROM sorting_hat")
+    sorting_payload: list[dict[str, Any]] = [
+        {"discord_id": str(r[0]), "house_id": r[1], "rate_bracket": r[2], "tier": r[3], "sorted_at": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT discord_id, total_xp, vc_seconds, text_messages, updated_at FROM contribution_totals")
+    totals_payload: list[dict[str, Any]] = [
+        {"discord_id": str(r[0]), "total_xp": r[1], "vc_seconds": r[2], "text_messages": r[3], "updated_at": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT year_month, discord_id, points, vc_seconds, text_messages FROM contribution_monthly")
+    monthly_payload: list[dict[str, Any]] = [
+        {"year_month": r[0], "discord_id": str(r[1]), "points": r[2], "vc_seconds": r[3], "text_messages": r[4]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT house_id, discord_id, set_at, set_by FROM house_leaders")
+    leaders_payload: list[dict[str, Any]] = [
+        {"house_id": r[0], "discord_id": str(r[1]), "set_at": r[2], "set_by": str(r[3]) if r[3] else None}
+        for r in cur.fetchall()
+    ]
+
+    # 直近60日分の日次スナップショット（個人ページのグラフ用）
+    cutoff_jst: datetime.date = datetime.datetime.now(jst).date() - datetime.timedelta(days=60)
+    cur.execute(
+        "SELECT snapshot_date, discord_id, total_xp, vc_seconds, text_messages FROM daily_snapshots WHERE snapshot_date >= ?",
+        (cutoff_jst.isoformat(),),
+    )
+    daily_payload: list[dict[str, Any]] = [
+        {"snapshot_date": r[0], "discord_id": str(r[1]), "total_xp": r[2], "vc_seconds": r[3], "text_messages": r[4]}
+        for r in cur.fetchall()
+    ]
+    con.close()
+
+    body: dict[str, Any] = {
+        "bot_version": BOT_VERSION,
+        "users": users_payload,
+        "sorting_hat": sorting_payload,
+        "contribution_totals": totals_payload,
+        "contribution_monthly": monthly_payload,
+        "house_leaders": leaders_payload,
+        "daily_snapshots": daily_payload,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                CLOUDFLARE_INGEST_URL,
+                headers={"Authorization": f"Bearer {INGEST_TOKEN}", "Content-Type": "application/json"},
+                data=json.dumps(body),
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                status: int = resp.status
+                text: str = await resp.text()
+    except Exception as e:
+        return {"ok": False, "error": f"request failed: {e}"}
+
+    if status != 200:
+        return {"ok": False, "status": status, "error": text[:300]}
+    try:
+        result: dict[str, Any] = json.loads(text)
+    except Exception:
+        result = {"raw": text}
+    return {"ok": True, "status": status, "counts": result.get("counts", {})}
+# -----------------------------
+
+
+# --- デバッグ用: ダイジェスト/サマリ手動投稿 ---
+@bot.slash_command(
+    name="debug_post_weekly_digest",
+    description="週次寮ダイジェストを手動投稿します。house 指定なしで全寮。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_post_weekly_digest(
+    ctx: discord.ApplicationContext,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象寮（省略時は全寮）",
+        choices=["raptor", "krug", "wolf", "gromp", "all"],
+        default="all",
+    ),
+) -> None:
+    await ctx.defer(ephemeral=True)
+    if house == "all":
+        summaries: list[str] = await post_weekly_digest_all()
+        await ctx.respond("✅ 全寮ダイジェスト投稿\n" + "\n".join(f"- {s}" for s in summaries), ephemeral=True)
+    else:
+        summary: str = await post_weekly_digest_for_house(house)
+        await ctx.respond(f"✅ ダイジェスト投稿: {summary}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_post_monthly_summary",
+    description="月次サマリを手動投稿します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_post_monthly_summary(
+    ctx: discord.ApplicationContext,
+    year_month: discord.Option(  # type: ignore[valid-type]
+        str,
+        "対象年月 (例: 2026-05)。省略時は先月。",
+        default="",
+    ) = "",
+) -> None:
+    await ctx.defer(ephemeral=True)
+    ym_arg: str | None = year_month if year_month else None
+    result: str = await post_monthly_summary(ym_arg)
+    await ctx.respond(f"✅ {result}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_save_weekly_snapshot",
+    description="今この瞬間の週次スナップショットを保存します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_save_weekly_snapshot(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    today: datetime.date = _this_jst_monday()
+    n: int = save_weekly_snapshot(today)
+    await ctx.respond(f"✅ snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_save_daily_snapshot",
+    description="今日（JST）の日次スナップショットを即時保存します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_save_daily_snapshot(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    today: datetime.date = datetime.datetime.now(jst).date()
+    n: int = save_daily_snapshot(today)
+    await ctx.respond(f"✅ daily snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_force_sync",
+    description="Cloudflare D1 への同期を即時実行します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_force_sync(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    result: dict[str, Any] = await sync_to_d1()
+    if result.get("ok"):
+        counts: dict[str, int] = result.get("counts", {})
+        await ctx.respond(
+            f"✅ 同期成功\n```json\n{json.dumps(counts, indent=2, ensure_ascii=False)}\n```",
+            ephemeral=True,
+        )
+    else:
+        await ctx.respond(f"❌ 同期失敗\nstatus={result.get('status')} error={result.get('error')}", ephemeral=True)
+
+
 # --- バックグラウンドタスク ---
-jst: datetime.timezone = datetime.timezone(datetime.timedelta(hours=9))
 @tasks.loop(time=datetime.time(hour=12, minute=0, tzinfo=jst))
 async def check_ranks_periodically() -> None:
     print("--- Starting periodic rank check ---")
@@ -948,8 +2371,98 @@ async def check_ranks_periodically() -> None:
 
     print("--- Periodic rank check finished ---")
 
+
+# 週次寮ダイジェスト: 毎日 10:00 JST に発火 → 月曜だけ実投稿
+@tasks.loop(time=datetime.time(hour=10, minute=0, tzinfo=jst))
+async def weekly_digest_task() -> None:
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if now_jst.weekday() != 0:  # 0 = Monday
+        return
+    print(f"--- weekly_digest_task firing on {now_jst.isoformat()} ---")
+    summaries: list[str] = await post_weekly_digest_all()
+    for s in summaries:
+        print(f"  weekly_digest: {s}")
+
+
+# 月次サマリ: 毎日 0:00 JST に発火 → 1日だけ実投稿
+@tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=jst))
+async def monthly_summary_task() -> None:
+    now_jst: datetime.datetime = datetime.datetime.now(jst)
+    if now_jst.day != 1:
+        return
+    print(f"--- monthly_summary_task firing on {now_jst.isoformat()} ---")
+    result: str = await post_monthly_summary()
+    print(f"  monthly_summary: {result}")
+
+
+# 日次スナップショット: 毎日 0:00 JST 発火（個人ページの日次グラフ用）
+@tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=jst))
+async def daily_snapshot_task() -> None:
+    today: datetime.date = datetime.datetime.now(jst).date()
+    n: int = save_daily_snapshot(today)
+    print(f"--- daily_snapshot {today.isoformat()}: {n} rows ---")
+
+
+# Bot → Cloudflare D1: 5分おきに全件同期
+@tasks.loop(minutes=5)
+async def sync_to_d1_task() -> None:
+    if not CLOUDFLARE_INGEST_URL or not INGEST_TOKEN:
+        return  # 環境変数なしのときは何もしない
+    result: dict[str, Any] = await sync_to_d1()
+    if result.get("ok"):
+        counts: dict[str, int] = result.get("counts", {})
+        print(f"--- sync_to_d1 OK: {counts} ---")
+    else:
+        print(f"!!! sync_to_d1 FAILED: status={result.get('status')} error={result.get('error')}")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    # Bot自身・DM・システムメッセージは除外
+    if message.author.bot or message.guild is None:
+        return
+    discord_id: int = message.author.id
+    if not is_sorted(discord_id):
+        return
+    # 60秒クールダウン判定
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT last_text_at FROM contribution_totals WHERE discord_id = ?", (discord_id,))
+    row: tuple[str | None] | None = cur.fetchone()
+    con.close()
+    if row and row[0]:
+        try:
+            last_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+            if (now_utc - last_at).total_seconds() < CONTRIBUTION_TEXT_COOLDOWN_SECONDS:
+                return
+        except ValueError:
+            pass
+    old_level, new_level = add_contribution(
+        discord_id,
+        xp=CONTRIBUTION_TEXT_PT_PER_MESSAGE,
+        vc_seconds=0,
+        text_messages=1,
+        last_text_at_iso=now_utc.isoformat(),
+    )
+    if new_level > old_level:
+        await notify_level_up(discord_id, old_level, new_level)
+
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    # --- コントリビューション: VC在室秒数の計測 ---
+    # チャンネルが変わったとき（join / leave / move）のみ処理
+    if not member.bot and before.channel != after.channel:
+        # 旧セッションを確定（退出 or 移動元）
+        if before.channel is not None:
+            old_level, new_level = vc_session_end(member.id)
+            if new_level > old_level:
+                await notify_level_up(member.id, old_level, new_level)
+        # 新セッション開始（入室 or 移動先）。組分け済みのみ計測対象
+        if after.channel is not None and is_sorted(member.id):
+            vc_session_start(member.id, after.channel.id)
+
     guild: discord.Guild = member.guild
     category: discord.CategoryChannel | None = discord.utils.get(guild.categories, id=1469467787356410030)
 
