@@ -166,6 +166,17 @@ def setup_database() -> None:
             PRIMARY KEY (snapshot_date, discord_id)
         )
     ''')
+    # 日次スナップショット: 個人ページの「日次成果グラフ」算定に使用
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS daily_snapshots (
+            snapshot_date  TEXT NOT NULL,
+            discord_id     INTEGER NOT NULL,
+            total_xp       INTEGER NOT NULL DEFAULT 0,
+            vc_seconds     INTEGER NOT NULL DEFAULT 0,
+            text_messages  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (snapshot_date, discord_id)
+        )
+    ''')
     # 寮長: 管理者が手動で任命。D1への同期も同形式
     cur.execute('''
         CREATE TABLE IF NOT EXISTS house_leaders (
@@ -911,6 +922,21 @@ async def on_ready() -> None:
         weekly_digest_task.start()
     if not monthly_summary_task.is_running():
         monthly_summary_task.start()
+    if not daily_snapshot_task.is_running():
+        daily_snapshot_task.start()
+    # 起動時、今日のスナップショットが無ければ取る（個人ページのグラフが初回から表示できるように）
+    try:
+        today_jst: datetime.date = datetime.datetime.now(jst).date()
+        _con_ds: sqlite3.Connection = sqlite3.connect(DB_PATH)
+        _cur_ds: sqlite3.Cursor = _con_ds.cursor()
+        _cur_ds.execute("SELECT COUNT(*) FROM daily_snapshots WHERE snapshot_date = ?", (today_jst.isoformat(),))
+        _exists: int = _cur_ds.fetchone()[0]
+        _con_ds.close()
+        if _exists == 0:
+            save_daily_snapshot(today_jst)
+            print(f"--- daily_snapshot bootstrap for {today_jst.isoformat()} ---")
+    except Exception as e:
+        print(f"!!! daily_snapshot bootstrap failed: {e}")
     if CLOUDFLARE_INGEST_URL and INGEST_TOKEN and not sync_to_d1_task.is_running():
         sync_to_d1_task.start()
         print("--- D1 sync task started (5min interval) ---")
@@ -1748,6 +1774,29 @@ def save_weekly_snapshot(snapshot_date: datetime.date) -> int:
     return written
 
 
+def save_daily_snapshot(snapshot_date: datetime.date) -> int:
+    """全組分け済みメンバーの現在累積を日次スナップショットへ保存。"""
+    iso_date: str = snapshot_date.isoformat()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO daily_snapshots (snapshot_date, discord_id, total_xp, vc_seconds, text_messages)
+        SELECT ?, s.discord_id,
+               COALESCE(t.total_xp, 0),
+               COALESCE(t.vc_seconds, 0),
+               COALESCE(t.text_messages, 0)
+        FROM sorting_hat s
+        LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
+        """,
+        (iso_date,),
+    )
+    written: int = cur.rowcount
+    con.commit()
+    con.close()
+    return written
+
+
 async def post_weekly_digest_for_house(house_id: str) -> str:
     """指定寮の週次ダイジェストを 該当寮 リーダーボード へ投稿。
 
@@ -2085,6 +2134,17 @@ async def sync_to_d1() -> dict[str, Any]:
         {"house_id": r[0], "discord_id": str(r[1]), "set_at": r[2], "set_by": str(r[3]) if r[3] else None}
         for r in cur.fetchall()
     ]
+
+    # 直近60日分の日次スナップショット（個人ページのグラフ用）
+    cutoff_jst: datetime.date = datetime.datetime.now(jst).date() - datetime.timedelta(days=60)
+    cur.execute(
+        "SELECT snapshot_date, discord_id, total_xp, vc_seconds, text_messages FROM daily_snapshots WHERE snapshot_date >= ?",
+        (cutoff_jst.isoformat(),),
+    )
+    daily_payload: list[dict[str, Any]] = [
+        {"snapshot_date": r[0], "discord_id": str(r[1]), "total_xp": r[2], "vc_seconds": r[3], "text_messages": r[4]}
+        for r in cur.fetchall()
+    ]
     con.close()
 
     body: dict[str, Any] = {
@@ -2094,6 +2154,7 @@ async def sync_to_d1() -> dict[str, Any]:
         "contribution_totals": totals_payload,
         "contribution_monthly": monthly_payload,
         "house_leaders": leaders_payload,
+        "daily_snapshots": daily_payload,
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -2174,6 +2235,19 @@ async def debug_save_weekly_snapshot(ctx: discord.ApplicationContext) -> None:
     today: datetime.date = _this_jst_monday()
     n: int = save_weekly_snapshot(today)
     await ctx.respond(f"✅ snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
+
+
+@bot.slash_command(
+    name="debug_save_daily_snapshot",
+    description="今日（JST）の日次スナップショットを即時保存します。（デバッグ用）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def debug_save_daily_snapshot(ctx: discord.ApplicationContext) -> None:
+    await ctx.defer(ephemeral=True)
+    today: datetime.date = datetime.datetime.now(jst).date()
+    n: int = save_daily_snapshot(today)
+    await ctx.respond(f"✅ daily snapshot saved: date={today.isoformat()} rows={n}", ephemeral=True)
 
 
 @bot.slash_command(
@@ -2319,6 +2393,14 @@ async def monthly_summary_task() -> None:
     print(f"--- monthly_summary_task firing on {now_jst.isoformat()} ---")
     result: str = await post_monthly_summary()
     print(f"  monthly_summary: {result}")
+
+
+# 日次スナップショット: 毎日 0:00 JST 発火（個人ページの日次グラフ用）
+@tasks.loop(time=datetime.time(hour=0, minute=0, tzinfo=jst))
+async def daily_snapshot_task() -> None:
+    today: datetime.date = datetime.datetime.now(jst).date()
+    n: int = save_daily_snapshot(today)
+    print(f"--- daily_snapshot {today.isoformat()}: {n} rows ---")
 
 
 # Bot → Cloudflare D1: 5分おきに全件同期

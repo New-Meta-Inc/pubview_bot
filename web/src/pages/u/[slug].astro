@@ -26,9 +26,16 @@ interface MonthlyRow {
   vc_seconds: number;
   text_messages: number;
 }
+interface DailySnapshotRow {
+  snapshot_date: string;
+  total_xp: number;
+  vc_seconds: number;
+  text_messages: number;
+}
 
 let user: UserData | null = null;
 let monthlyHistory: MonthlyRow[] = [];
+let dailySnapshots: DailySnapshotRow[] = [];
 let overallRank: number | null = null;
 let houseRank: number | null = null;
 let houseMemberCount: number = 0;
@@ -59,6 +66,16 @@ if (env?.DB) {
        LIMIT 12`,
     ).bind(user.discord_id).all<MonthlyRow>();
     monthlyHistory = m.results ?? [];
+
+    // 2.5) 日次スナップショット（直近31日 + 当日比較用に少し多めで取得、後でclient側で diff 計算）
+    const ds = await env.DB.prepare(
+      `SELECT snapshot_date, total_xp, vc_seconds, text_messages
+       FROM daily_snapshots
+       WHERE discord_id = ?
+       ORDER BY snapshot_date DESC
+       LIMIT 35`,
+    ).bind(user.discord_id).all<DailySnapshotRow>();
+    dailySnapshots = (ds.results ?? []).slice().reverse(); // 古い順
 
     // 3) 全体ランク（累積XP順）
     const allRank = await env.DB.prepare(
@@ -109,6 +126,39 @@ function vcHM(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
   return `${h}h ${m}m`;
+}
+
+// 日次グラフ用データ: 連続した日付の系列を生成し、各日の獲得XP(=当日total_xp - 前日total_xp)を計算
+interface DailyPoint {
+  date: string;        // YYYY-MM-DD
+  label: string;       // M/D
+  gainedXp: number;
+  cumulativeXp: number;
+}
+function buildDailyChart(snapshots: DailySnapshotRow[], currentTotalXp: number, days: number = 30): DailyPoint[] {
+  const tzDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+  const byDate = new Map<string, DailySnapshotRow>();
+  for (const s of snapshots) byDate.set(s.snapshot_date, s);
+  // 直近 days+1 日分の系列（前日比較で初日が0になる分1日多く取る）
+  const points: DailyPoint[] = [];
+  let prevTotal = 0;
+  for (let i = days; i >= 0; i--) {
+    const d = new Date(tzDate.getTime() - i * 24 * 60 * 60 * 1000);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const label = `${d.getMonth() + 1}/${d.getDate()}`;
+    const row = byDate.get(iso);
+    // 「今日(=i==0)」は現在の累積XPを使い、進行中の獲得分も反映
+    let cumulative: number;
+    if (i === 0) {
+      cumulative = currentTotalXp;
+    } else {
+      cumulative = row ? row.total_xp : prevTotal;
+    }
+    const gained = Math.max(0, cumulative - prevTotal);
+    points.push({ date: iso, label, gainedXp: gained, cumulativeXp: cumulative });
+    prevTotal = cumulative;
+  }
+  return points.slice(1); // 基準点を捨てる
 }
 ---
 <Layout title={`${user.display_name} | ぱぶびゅ！ダッシュボード`}>
@@ -186,6 +236,83 @@ function vcHM(seconds: number): string {
         )}
       </section>
     )}
+
+    {(() => {
+      const points = buildDailyChart(dailySnapshots, user.total_xp, 30);
+      const maxGain = Math.max(1, ...points.map((p) => p.gainedXp));
+      const totalGain30d = points.reduce((s, p) => s + p.gainedXp, 0);
+      const chartW = 600;
+      const chartH = 140;
+      const padTop = 8;
+      const padBottom = 22;
+      const barAreaH = chartH - padTop - padBottom;
+      const barW = chartW / points.length;
+      const accent = houseDef?.themeBar?.replace('bg-', '') ?? 'slate-500';
+      const accentColor = {
+        'raptor': '#3FA34D',
+        'krug':   '#A0522D',
+        'wolf':   '#5B7C99',
+        'gromp':  '#7A5FA8',
+      }[houseDef?.id ?? ''] ?? '#64748b';
+      return (
+        <section class="mt-8 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
+          <div class="flex items-baseline justify-between">
+            <h2 class="text-lg font-bold">📈 日次成果（過去30日）</h2>
+            <p class="text-xs text-slate-500">
+              直近30日: <span class="font-mono tabular-nums text-slate-300">+{fmt(totalGain30d)} XP</span>
+            </p>
+          </div>
+          {totalGain30d === 0 ? (
+            <p class="mt-6 text-sm text-slate-500">この30日間の獲得XPはまだありません。テキスト投稿やVC在室で貯まり始めます。</p>
+          ) : (
+            <div class="mt-4 overflow-x-auto">
+              <svg viewBox={`0 0 ${chartW} ${chartH}`} preserveAspectRatio="none" class="h-36 w-full">
+                {points.map((p, i) => {
+                  const h = (p.gainedXp / maxGain) * barAreaH;
+                  const x = i * barW + 1;
+                  const y = padTop + (barAreaH - h);
+                  return (
+                    <g>
+                      <rect
+                        x={x}
+                        y={y}
+                        width={Math.max(1, barW - 2)}
+                        height={Math.max(h, p.gainedXp > 0 ? 1 : 0)}
+                        fill={accentColor}
+                        opacity={p.gainedXp > 0 ? 0.9 : 0.15}
+                        rx="1"
+                      >
+                        <title>{`${p.date}: +${p.gainedXp.toLocaleString()} XP (累積 ${p.cumulativeXp.toLocaleString()})`}</title>
+                      </rect>
+                      {/* 5日ごと + 最終日に日付ラベル */}
+                      {(i % 5 === 0 || i === points.length - 1) && (
+                        <text
+                          x={x + barW / 2}
+                          y={chartH - 6}
+                          text-anchor="middle"
+                          font-size="9"
+                          fill="#64748b"
+                          font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+                        >
+                          {p.label}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+                {/* 上部最大値ラベル */}
+                <text x="2" y={padTop + 8} font-size="9" fill="#475569" font-family="ui-monospace">
+                  最大 {fmt(maxGain)} XP
+                </text>
+              </svg>
+            </div>
+          )}
+          <p class="mt-2 text-[10px] text-slate-500">
+            ※ バーにカーソルを乗せると詳細表示。今日のバーは進行中。
+          </p>
+        </section>
+      );
+    })()}
 
     <section class="mt-8 rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800 sm:p-6">
       <h2 class="text-lg font-bold">月別履歴</h2>

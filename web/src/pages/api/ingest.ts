@@ -44,6 +44,14 @@ interface HouseLeaderRow {
   set_by?: string | null;
 }
 
+interface DailySnapshotRow {
+  snapshot_date: string;
+  discord_id: string;
+  total_xp: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+
 interface IngestPayload {
   bot_version?: string;
   users: UserRow[];
@@ -51,6 +59,7 @@ interface IngestPayload {
   contribution_totals: TotalsRow[];
   contribution_monthly: MonthlyRow[];
   house_leaders?: HouseLeaderRow[];
+  daily_snapshots?: DailySnapshotRow[];
 }
 
 export const POST: APIRoute = async ({ request, locals }) => {
@@ -76,7 +85,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
     });
   }
 
-  const { users = [], sorting_hat = [], contribution_totals = [], contribution_monthly = [], house_leaders = [] } = payload;
+  const { users = [], sorting_hat = [], contribution_totals = [], contribution_monthly = [], house_leaders = [], daily_snapshots = [] } = payload;
 
   const statements: D1PreparedStatement[] = [];
 
@@ -162,6 +171,19 @@ export const POST: APIRoute = async ({ request, locals }) => {
     );
   }
 
+  for (const d of daily_snapshots) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO daily_snapshots (snapshot_date, discord_id, total_xp, vc_seconds, text_messages)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(snapshot_date, discord_id) DO UPDATE SET
+           total_xp      = excluded.total_xp,
+           vc_seconds    = excluded.vc_seconds,
+           text_messages = excluded.text_messages`,
+      ).bind(d.snapshot_date, d.discord_id, d.total_xp, d.vc_seconds, d.text_messages),
+    );
+  }
+
   statements.push(
     env.DB.prepare(
       `INSERT INTO ingest_log (ingested_at, users_count, sorting_count, totals_count, monthly_count, bot_version)
@@ -187,6 +209,7 @@ export const POST: APIRoute = async ({ request, locals }) => {
         contribution_totals: contribution_totals.length,
         contribution_monthly: contribution_monthly.length,
         house_leaders: house_leaders.length,
+        daily_snapshots: daily_snapshots.length,
       },
     }),
     { status: 200, headers: { 'content-type': 'application/json' } },
