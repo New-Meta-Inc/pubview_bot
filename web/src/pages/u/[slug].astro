@@ -192,8 +192,8 @@ function buildDailyChart(snapshots: DailySnapshotRow[], currentTotalXp: number, 
 
       <div class="mt-5">
         <div class="flex items-baseline justify-between text-xs text-slate-300">
-          <span>{fmt(inLv)} / {fmt(span)} XP</span>
           <span>次Lv {lv + 1} まで</span>
+          <span>{fmt(inLv)} / {fmt(span)} XP</span>
         </div>
         <div class="mt-1 h-2.5 overflow-hidden rounded-full bg-slate-900/70">
           <div class={`h-full ${houseDef?.themeBar ?? 'bg-slate-600'}`} style={`width: ${progress}%`}></div>

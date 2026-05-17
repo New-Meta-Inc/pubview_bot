@@ -24,6 +24,7 @@ NOTIFICATION_CHANNEL_ID: int = 1401719055643312219 # 通知用チャンネルID
 HONOR_CHANNEL_ID: int = 1447166222591594607 # 名誉用チャンネルID
 VOICE_CREATE_CHANNEL_ID: int = 1469467862358823125
 RANK_GAME_CHANNEL_ID: int = 1470346492895166566
+AFK_CHANNEL_ID: int = 1396150541608026303  # 寝落ち/AFK 用VC、コントリビューション計測対象外
 RANK_ROLES: dict[str, str] = {
     "IRON": "LoL Iron(Solo/Duo)", "BRONZE": "LoL Bronze(Solo/Duo)", "SILVER": "LoL Silver(Solo/Duo)",
     "GOLD": "LoL Gold(Solo/Duo)", "PLATINUM": "LoL Platinum(Solo/Duo)", "EMERALD": "LoL Emerald(Solo/Duo)",
@@ -899,14 +900,17 @@ async def on_ready() -> None:
     # --- コントリビューション: 起動時のVC在室者スキャン ---
     # 再起動を跨いで在室している組分け済みメンバーを vc_sessions に再登録する
     # （再起動中の時間はロストする。今この瞬間からの計測再開）
+    # AFK チャンネルは計測対象外
     for guild in bot.guilds:
         for vc in guild.voice_channels:
+            if vc.id == AFK_CHANNEL_ID:
+                continue
             for vc_member in vc.members:
                 if vc_member.bot:
                     continue
                 if is_sorted(vc_member.id):
                     vc_session_start(vc_member.id, vc.id)
-    print("--- VC sessions re-initialized for sorted members ---")
+    print("--- VC sessions re-initialized for sorted members (AFK excluded) ---")
 
     # 起動時ランキング速報は一旦停止（再開する場合は下記ブロックを有効化）
     # print("--- Posting initial ranking on startup ---")
@@ -2454,13 +2458,13 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     # --- コントリビューション: VC在室秒数の計測 ---
     # チャンネルが変わったとき（join / leave / move）のみ処理
     if not member.bot and before.channel != after.channel:
-        # 旧セッションを確定（退出 or 移動元）
+        # 旧セッションを確定（退出 or 移動元）。AFKチャンネルからの移動は session 自体が無いので no-op
         if before.channel is not None:
             old_level, new_level = vc_session_end(member.id)
             if new_level > old_level:
                 await notify_level_up(member.id, old_level, new_level)
-        # 新セッション開始（入室 or 移動先）。組分け済みのみ計測対象
-        if after.channel is not None and is_sorted(member.id):
+        # 新セッション開始（入室 or 移動先）。組分け済みかつ AFK 以外のみ計測対象
+        if after.channel is not None and after.channel.id != AFK_CHANNEL_ID and is_sorted(member.id):
             vc_session_start(member.id, after.channel.id)
 
     guild: discord.Guild = member.guild

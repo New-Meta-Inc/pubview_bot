@@ -154,8 +154,8 @@ function userLevelInfo(xp: number) {
 
             <div class="mt-3">
               <div class="flex items-baseline justify-between text-xs text-slate-400">
+                <span>次Lv {level + 1} まで</span>
                 <span>{fmt(s.total_xp - curXp)} / {fmt(nextXp - curXp)} XP</span>
-                <span>次Lvまで</span>
               </div>
               <div class="mt-1 h-2 overflow-hidden rounded-full bg-slate-900/70">
                 <div class={`h-full ${h.themeBar}`} style={`width: ${progress}%`}></div>

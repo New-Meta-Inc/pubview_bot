@@ -125,8 +125,8 @@ function userLevelInfo(xp: number) {
 
       <div class="mt-5">
         <div class="flex items-baseline justify-between text-xs text-slate-200">
+          <span>次Lv {houseLv + 1} まで</span>
           <span>{fmt(stats.total_xp - houseCurXp)} / {fmt(houseNextXp - houseCurXp)} XP</span>
-          <span>次Lvまで</span>
         </div>
         <div class="mt-1 h-2.5 overflow-hidden rounded-full bg-slate-900/70">
           <div class={`h-full ${houseDef.themeBar}`} style={`width: ${houseProgress}%`}></div>
