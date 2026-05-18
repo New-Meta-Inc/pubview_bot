@@ -1,0 +1,163 @@
+---
+import Layout from '../layouts/Layout.astro';
+import { HOUSES, houseById, levelFromXp, requiredXpForLevel, USER_LEVEL_COEF, USER_LEVEL_EXP } from '../lib/houses.ts';
+
+export const prerender = false;
+
+const env = (Astro.locals as { runtime?: { env?: { DB?: D1Database } } }).runtime?.env;
+
+const url = new URL(Astro.request.url);
+const modeParam = (url.searchParams.get('mode') ?? 'monthly').toLowerCase();
+const mode: 'monthly' | 'total' = modeParam === 'total' ? 'total' : 'monthly';
+const houseFilter = url.searchParams.get('house') ?? '';
+const validHouseFilter = HOUSES.find((h) => h.id === houseFilter) ? houseFilter : '';
+
+const currentYm = new Date().toLocaleString('sv-SE', { timeZone: 'Asia/Tokyo' }).slice(0, 7);
+
+interface Row {
+  discord_id: string;
+  display_name: string;
+  avatar_url: string | null;
+  house_id: string;
+  total_xp: number;
+  month_pt: number;
+  vc_seconds: number;
+  text_messages: number;
+}
+
+let rows: Row[] = [];
+if (env?.DB) {
+  const orderBy = mode === 'total' ? 'total_xp DESC' : 'month_pt DESC, total_xp DESC';
+  const whereHouse = validHouseFilter ? 'AND sh.house_id = ?' : '';
+  const sql = `
+    SELECT u.discord_id, u.display_name, u.avatar_url, sh.house_id,
+           COALESCE(ct.total_xp, 0)      AS total_xp,
+           COALESCE(cm.points,  0)       AS month_pt,
+           COALESCE(ct.vc_seconds, 0)    AS vc_seconds,
+           COALESCE(ct.text_messages, 0) AS text_messages
+    FROM sorting_hat sh
+    JOIN users u ON sh.discord_id = u.discord_id
+    LEFT JOIN contribution_totals  ct ON sh.discord_id = ct.discord_id
+    LEFT JOIN contribution_monthly cm ON sh.discord_id = cm.discord_id AND cm.year_month = ?
+    WHERE 1=1 ${whereHouse}
+    ORDER BY ${orderBy}
+    LIMIT 100
+  `;
+  const params: (string | number)[] = [currentYm];
+  if (validHouseFilter) params.push(validHouseFilter);
+  const result = await env.DB.prepare(sql).bind(...params).all<Row>();
+  rows = result.results ?? [];
+}
+
+function fmt(n: number): string {
+  return n.toLocaleString('en-US');
+}
+function vcHM(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+function userLevelInfo(xp: number) {
+  const level = levelFromXp(xp, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const curXp = requiredXpForLevel(level, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const nextXp = requiredXpForLevel(level + 1, USER_LEVEL_COEF, USER_LEVEL_EXP);
+  const inLv = xp - curXp;
+  const span = Math.max(1, nextXp - curXp);
+  const progress = Math.min(100, Math.max(0, (inLv / span) * 100));
+  return { level, inLv, span, progress };
+}
+
+const modeLabel = mode === 'total' ? '累積XP順' : '今月pt順';
+const valueLabelShort = mode === 'total' ? 'XP' : 'pt';
+
+function buildHref(overrides: { mode?: string; house?: string }): string {
+  const sp = new URLSearchParams();
+  const m = overrides.mode ?? mode;
+  if (m !== 'monthly') sp.set('mode', m);
+  const h = overrides.house ?? validHouseFilter;
+  if (h) sp.set('house', h);
+  const s = sp.toString();
+  return s ? `/leaderboard?${s}` : '/leaderboard';
+}
+---
+<Layout title={`ランキング (${modeLabel}) | ぱぶびゅ！ダッシュボード`}>
+  <main class="mx-auto max-w-4xl px-4 py-10 sm:px-6 sm:py-14">
+    <nav class="mb-6 text-sm">
+      <a href="/" class="text-slate-400 hover:text-slate-200">← 寮対抗ボードへ戻る</a>
+    </nav>
+
+    <header>
+      <p class="text-xs uppercase tracking-[0.3em] text-slate-500">pubview / leaderboard</p>
+      <h1 class="text-3xl font-bold tracking-tight sm:text-4xl">🏆 個人ランキング</h1>
+      <p class="mt-1 text-sm text-slate-400">{modeLabel}・{validHouseFilter ? `${houseById(validHouseFilter)?.emoji} ${houseById(validHouseFilter)?.name} のみ` : '全寮'}・最大100名</p>
+    </header>
+
+    <!-- フィルタ切替 -->
+    <section class="mt-6 flex flex-wrap items-center gap-3 text-xs">
+      <div class="flex items-center gap-1.5">
+        <span class="text-slate-500">並び替え:</span>
+        <a href={buildHref({ mode: 'monthly' })} class={`rounded px-2.5 py-1 ${mode === 'monthly' ? 'bg-slate-700 text-slate-100' : 'bg-slate-900/60 text-slate-400 hover:text-slate-200'}`}>今月pt</a>
+        <a href={buildHref({ mode: 'total' })} class={`rounded px-2.5 py-1 ${mode === 'total' ? 'bg-slate-700 text-slate-100' : 'bg-slate-900/60 text-slate-400 hover:text-slate-200'}`}>累積XP</a>
+      </div>
+      <div class="flex items-center gap-1.5">
+        <span class="text-slate-500">寮:</span>
+        <a href={buildHref({ house: '' })} class={`rounded px-2.5 py-1 ${!validHouseFilter ? 'bg-slate-700 text-slate-100' : 'bg-slate-900/60 text-slate-400 hover:text-slate-200'}`}>全寮</a>
+        {HOUSES.map((h) => (
+          <a href={buildHref({ house: h.id })} class={`rounded px-2.5 py-1 ${validHouseFilter === h.id ? `${h.themeBar} text-slate-100` : 'bg-slate-900/60 text-slate-400 hover:text-slate-200'}`}>
+            {h.emoji} {h.name}
+          </a>
+        ))}
+      </div>
+    </section>
+
+    <section class="mt-6 rounded-2xl bg-slate-900/60 p-4 ring-1 ring-slate-800 sm:p-6">
+      {rows.length === 0 ? (
+        <p class="py-6 text-center text-sm text-slate-500">該当するメンバーがいません。</p>
+      ) : (
+        <ol class="divide-y divide-slate-800">
+          {rows.map((m, i) => {
+            const h = houseById(m.house_id);
+            const lv = userLevelInfo(m.total_xp);
+            const value = mode === 'total' ? m.total_xp : m.month_pt;
+            return (
+              <li class="flex items-center gap-3 py-3 text-sm">
+                <span class="w-10 text-right font-mono text-slate-500 tabular-nums">#{i + 1}</span>
+                <img
+                  src={m.avatar_url ?? '/favicon.svg'}
+                  alt=""
+                  loading="lazy"
+                  class="h-8 w-8 shrink-0 rounded-full bg-slate-800 object-cover"
+                />
+                <a href={`/houses/${m.house_id}`} class={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-base ${h?.themeBg ?? 'bg-slate-800'} ${h?.themeRing ?? 'ring-slate-700'} ring-1 hover:ring-2`} title={h?.name ?? ''}>
+                  {h?.emoji ?? '?'}
+                </a>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <a href={`/u/${encodeURIComponent(m.display_name)}`} class="truncate font-medium hover:underline">{m.display_name}</a>
+                    <span class={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-bold tabular-nums text-slate-100 ${h?.themeBar ?? 'bg-slate-700'}`}>Lv {lv.level}</span>
+                  </div>
+                  <div class="mt-1 flex items-center gap-2">
+                    <div class="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-800">
+                      <div class={`h-full ${h?.themeBar ?? 'bg-slate-600'}`} style={`width: ${lv.progress}%`}></div>
+                    </div>
+                    <span class="shrink-0 font-mono text-[10px] text-slate-500 tabular-nums">
+                      {fmt(lv.inLv)}/{fmt(lv.span)} XP
+                    </span>
+                  </div>
+                </div>
+                <div class="shrink-0 text-right">
+                  <div class="font-mono text-slate-200 tabular-nums">{fmt(value)} {valueLabelShort}</div>
+                  <div class="text-[10px] text-slate-500 tabular-nums">VC {vcHM(m.vc_seconds)} ・ {fmt(m.text_messages)}件</div>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </section>
+
+    <footer class="mt-8 text-center text-xs text-slate-500">
+      <a href="/" class="hover:text-slate-300">← トップへ戻る</a>
+    </footer>
+  </main>
+</Layout>

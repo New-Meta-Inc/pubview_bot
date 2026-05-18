@@ -1,0 +1,13 @@
+name = "pubview-dashboard"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+pages_build_output_dir = "./dist"
+
+# D1: Bot から同期したコントリビューションデータを保持
+[[d1_databases]]
+binding = "DB"
+database_name = "pubview-dashboard-db"
+database_id = "c7842d1c-8e22-47fd-a823-e53c9b095021"
+
+# シークレットは wrangler secret put で登録（リポジトリに含めない）:
+#   wrangler pages secret put INGEST_TOKEN --project-name pubview-dashboard
