@@ -4,11 +4,11 @@ export default {
   theme: {
     extend: {
       colors: {
-        // 寮テーマカラー（LoLジャングルキャンプ準拠）
-        raptor: { DEFAULT: '#3FA34D', dark: '#1F5A2A' },
-        krug:   { DEFAULT: '#A0522D', dark: '#5B2E18' },
-        wolf:   { DEFAULT: '#5B7C99', dark: '#324A60' },
-        gromp:  { DEFAULT: '#7A5FA8', dark: '#46356A' },
+        // 寮テーマカラー（LoL Elemental Drake 準拠、内部ID は旧名のまま）
+        raptor: { DEFAULT: '#3FA34D', dark: '#1F5A2A' }, // → ケミテック (緑)
+        krug:   { DEFAULT: '#2E7BB8', dark: '#143C5A' }, // → オーシャン (青)
+        wolf:   { DEFAULT: '#DC4438', dark: '#6B201A' }, // → インファーナル (赤)
+        gromp:  { DEFAULT: '#7A5FA8', dark: '#46356A' }, // → ヘクステック (紫、既存維持)
       },
     },
   },
