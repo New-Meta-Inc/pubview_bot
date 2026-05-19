@@ -476,12 +476,55 @@ class DashboardView(discord.ui.View):
                 )
                 return
 
-        await interaction.response.send_message(
-            content="🎩 帽子があなたの最高レートを尋ねています…\nプルダウンから最高到達Tierを選んでください。",
-            view=SortingHatTierSelectView(),
-            ephemeral=True,
-            delete_after=180,
+        # 寮加入規則の同意 (オプトイン) を挟む
+        rules_embed: discord.Embed = discord.Embed(
+            title="🏰 ぱぶびゅ！ 寮 加入規則",
+            description=(
+                "寮に入る前に、以下の3点に **同意** してください。\n"
+                "\n"
+                "1. **寮長の指示には基本的に従うこと**\n"
+                "2. **過度な煽り合いは禁止**。健全な対抗戦を楽しむこと\n"
+                "3. **規約違反時は、寮または ぱぶびゅ！Discord サーバーから追放される可能性があります**\n"
+                "\n"
+                "下のボタンで同意し、組分け帽子を被ってください。"
+            ),
+            color=discord.Color.purple(),
         )
+        await interaction.response.send_message(
+            embed=rules_embed,
+            view=SortingHatConsentView(),
+            ephemeral=True,
+            delete_after=240,
+        )
+
+
+# --- 組分け帽子: 加入規則の同意 View ---
+class SortingHatConsentView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=240)
+
+    @discord.ui.button(label="✅ 同意して組分け帽子を被る", style=discord.ButtonStyle.success, custom_id="sorting_hat:consent")
+    async def consent_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        # レース対策: 同意操作中に他フローで組分けが終わっている可能性をチェック
+        con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+        cur: sqlite3.Cursor = con.cursor()
+        cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (interaction.user.id,))
+        if cur.fetchone():
+            con.close()
+            await interaction.response.edit_message(
+                content="既に組分け済みです。",
+                embed=None,
+                view=None,
+            )
+            return
+        con.close()
+
+        await interaction.response.edit_message(
+            content="🎩 帽子があなたの最高レートを尋ねています…\nプルダウンから最高到達Tierを選んでください。",
+            embed=None,
+            view=SortingHatTierSelectView(),
+        )
+
 
 # --- 組分け帽子: UI と振り分けロジック ---
 class SortingHatTierSelectView(discord.ui.View):
