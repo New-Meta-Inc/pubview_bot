@@ -12,7 +12,7 @@ export const HOUSES: HouseDef[] = [
   { id: 'raptor', name: 'ケミテック',   emoji: '🧪', themeBg: 'bg-raptor-dark/40', themeRing: 'ring-raptor/40', themeAccent: 'text-raptor', themeBar: 'bg-raptor' },
   { id: 'krug',   name: 'オーシャン',   emoji: '🌊', themeBg: 'bg-krug-dark/40',   themeRing: 'ring-krug/40',   themeAccent: 'text-krug',   themeBar: 'bg-krug' },
   { id: 'wolf',   name: 'インファーナル', emoji: '🔥', themeBg: 'bg-wolf-dark/40',   themeRing: 'ring-wolf/40',   themeAccent: 'text-wolf',   themeBar: 'bg-wolf' },
-  { id: 'gromp',  name: 'ヘクステック', emoji: '🤖', themeBg: 'bg-gromp-dark/40',  themeRing: 'ring-gromp/40',  themeAccent: 'text-gromp',  themeBar: 'bg-gromp' },
+  { id: 'gromp',  name: 'ヘクステック', emoji: '⚡', themeBg: 'bg-gromp-dark/40',  themeRing: 'ring-gromp/40',  themeAccent: 'text-gromp',  themeBar: 'bg-gromp' },
 ];
 
 export const HOUSE_LEVEL_COEF = 300;
