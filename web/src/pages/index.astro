@@ -143,7 +143,11 @@ function userLevelInfo(xp: number) {
                 <div class="text-4xl leading-none">{h.emoji}</div>
                 <h2 class={`mt-2 text-lg font-bold ${h.themeAccent}`}>{h.name}</h2>
                 <p class="mt-0.5 text-xs text-slate-400">
-                  寮長: {leaderByHouse[h.id] ? <span class="text-slate-200">{leaderByHouse[h.id]}</span> : <span class="text-slate-500">未任命</span>}
+                  寮長: {leaderByHouse[h.id] ? (
+                    <a href={`/u/${encodeURIComponent(leaderByHouse[h.id])}`} class="relative z-10 text-slate-200 hover:underline">{leaderByHouse[h.id]}</a>
+                  ) : (
+                    <span class="text-slate-500">未任命</span>
+                  )}
                 </p>
               </div>
               <div class="text-right">

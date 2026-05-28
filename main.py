@@ -39,7 +39,7 @@ HOUSES: list[tuple[str, str, str, str]] = [
     ("raptor", "ケミテック",   "🧪", "ケミテック"),
     ("krug",   "オーシャン",   "🌊", "オーシャン"),
     ("wolf",   "インファーナル", "🔥", "インファーナル"),
-    ("gromp",  "ヘクステック", "🤖", "ヘクステック"),
+    ("gromp",  "ヘクステック", "⚡", "ヘクステック"),
 ]
 
 # プルダウン用のTier一覧（最高レート選択肢）
@@ -476,12 +476,55 @@ class DashboardView(discord.ui.View):
                 )
                 return
 
-        await interaction.response.send_message(
-            content="🎩 帽子があなたの最高レートを尋ねています…\nプルダウンから最高到達Tierを選んでください。",
-            view=SortingHatTierSelectView(),
-            ephemeral=True,
-            delete_after=180,
+        # 寮加入規則の同意 (オプトイン) を挟む
+        rules_embed: discord.Embed = discord.Embed(
+            title="🏰 ぱぶびゅ！ 寮 加入規則",
+            description=(
+                "寮に入る前に、以下の3点に **同意** してください。\n"
+                "\n"
+                "1. **寮長の指示には基本的に従うこと**\n"
+                "2. **過度な煽り合いは禁止**。健全な対抗戦を楽しむこと\n"
+                "3. **規約違反時は、寮または ぱぶびゅ！Discord サーバーから追放される可能性があります**\n"
+                "\n"
+                "下のボタンで同意し、組分け帽子を被ってください。"
+            ),
+            color=discord.Color.purple(),
         )
+        await interaction.response.send_message(
+            embed=rules_embed,
+            view=SortingHatConsentView(),
+            ephemeral=True,
+            delete_after=240,
+        )
+
+
+# --- 組分け帽子: 加入規則の同意 View ---
+class SortingHatConsentView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=240)
+
+    @discord.ui.button(label="✅ 同意して組分け帽子を被る", style=discord.ButtonStyle.success, custom_id="sorting_hat:consent")
+    async def consent_button(self, button: discord.ui.Button, interaction: discord.Interaction) -> None:
+        # レース対策: 同意操作中に他フローで組分けが終わっている可能性をチェック
+        con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+        cur: sqlite3.Cursor = con.cursor()
+        cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (interaction.user.id,))
+        if cur.fetchone():
+            con.close()
+            await interaction.response.edit_message(
+                content="既に組分け済みです。",
+                embed=None,
+                view=None,
+            )
+            return
+        con.close()
+
+        await interaction.response.edit_message(
+            content="🎩 帽子があなたの最高レートを尋ねています…\nプルダウンから最高到達Tierを選んでください。",
+            embed=None,
+            view=SortingHatTierSelectView(),
+        )
+
 
 # --- 組分け帽子: UI と振り分けロジック ---
 class SortingHatTierSelectView(discord.ui.View):
@@ -1458,6 +1501,139 @@ async def setup_house_channels(ctx: discord.ApplicationContext) -> None:
 
     msg: str = "**寮チャンネルセットアップ完了**\n" + "\n".join(summary_lines)
     await ctx.respond(msg, ephemeral=True)
+
+
+# --- 管理者: 寮の手動操作 ---
+async def _remove_all_house_roles(guild: discord.Guild, member: discord.Member, except_house_id: str | None = None) -> list[str]:
+    """対象メンバーから「except_house_id 以外」の全寮ロールを剥奪する。剥奪した寮名のリストを返す。"""
+    removed: list[str] = []
+    for h_id, h_name, _emoji, role_name in HOUSES:
+        if h_id == except_house_id:
+            continue
+        role: discord.Role | None = discord.utils.get(guild.roles, name=role_name)
+        if role is not None and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="admin house re-assignment / remove")
+                removed.append(h_name)
+            except Exception as e:
+                print(f"!!! _remove_all_house_roles: failed to remove '{role_name}' from {member.id}: {e}")
+    return removed
+
+
+def _bracket_for_tier(tier: str | None) -> str:
+    """登録 tier から rate_bracket を逆引き。tier 不明なら 'low'。"""
+    if not tier:
+        return "low"
+    return RATE_BRACKET_OF_TIER.get(tier.upper(), "low")
+
+
+@bot.slash_command(
+    name="admin_remove_house",
+    description="指定ユーザーを寮から脱退させ、寮ロールを剥奪します。XPは保持されます。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def admin_remove_house(
+    ctx: discord.ApplicationContext,
+    user: discord.Member,
+) -> None:
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT house_id FROM sorting_hat WHERE discord_id = ?", (user.id,))
+    row: tuple[str] | None = cur.fetchone()
+    if row is None:
+        con.close()
+        await ctx.respond(f"{user.display_name} はそもそも組分け済みではありません。", ephemeral=True)
+        return
+    cur.execute("DELETE FROM sorting_hat WHERE discord_id = ?", (user.id,))
+    con.commit()
+    con.close()
+
+    removed: list[str] = await _remove_all_house_roles(guild, user, except_house_id=None)
+
+    prev_house: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == row[0]), None)
+    prev_label: str = f"{prev_house[2]} {prev_house[1]}" if prev_house else row[0]
+    await ctx.respond(
+        f"✅ {user.mention} を **{prev_label}** から脱退させました。\n"
+        f"剥奪したロール: {', '.join(removed) if removed else 'なし'}\n"
+        f"⚠️ XP / コントリビューションの履歴は保持されています。\n"
+        "次回 D1 同期 (最大5分以内) でダッシュボードに反映されます。",
+        ephemeral=True,
+    )
+
+
+@bot.slash_command(
+    name="admin_set_house",
+    description="指定ユーザーを特定の寮に手動で登録します。（管理者向け）",
+    guild_ids=[DISCORD_GUILD_ID],
+)
+@discord.default_permissions(administrator=True)
+async def admin_set_house(
+    ctx: discord.ApplicationContext,
+    user: discord.Member,
+    house: discord.Option(  # type: ignore[valid-type]
+        str,
+        "登録先の寮",
+        choices=["raptor", "krug", "wolf", "gromp"],
+    ),
+) -> None:
+    await ctx.defer(ephemeral=True)
+    guild: discord.Guild | None = ctx.guild
+    if guild is None:
+        await ctx.respond("ギルド情報が取得できませんでした。", ephemeral=True)
+        return
+
+    info: tuple[str, str, str, str] | None = next((h for h in HOUSES if h[0] == house), None)
+    if info is None:
+        await ctx.respond(f"unknown house: {house}", ephemeral=True)
+        return
+    _, house_name_jp, house_emoji, role_name = info
+
+    # 登録 tier を users から拾って bracket を推定
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT tier FROM users WHERE discord_id = ?", (user.id,))
+    riot_row: tuple[str | None] | None = cur.fetchone()
+    tier: str = (riot_row[0] if riot_row and riot_row[0] else "UNRANKED").upper()
+    bracket: str = _bracket_for_tier(tier)
+
+    sorted_at: str = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    cur.execute(
+        "INSERT OR REPLACE INTO sorting_hat (discord_id, house_id, rate_bracket, tier, sorted_at) VALUES (?, ?, ?, ?, ?)",
+        (user.id, house, bracket, tier, sorted_at),
+    )
+    con.commit()
+    con.close()
+
+    # Discord ロールを更新: 他寮ロール剥奪 → 対象寮ロール付与
+    removed: list[str] = await _remove_all_house_roles(guild, user, except_house_id=house)
+    new_role: discord.Role | None = discord.utils.get(guild.roles, name=role_name)
+    role_msg: str = ""
+    if new_role is None:
+        role_msg = f"⚠️ ロール「{role_name}」が見つかりません。手動付与が必要です。"
+    elif new_role in user.roles:
+        role_msg = f"ロール「{role_name}」は既に付与済みです。"
+    else:
+        try:
+            await user.add_roles(new_role, reason=f"admin_set_house by {ctx.author}")
+            role_msg = f"ロール「{role_name}」を付与しました。"
+        except Exception as e:
+            role_msg = f"⚠️ ロール付与失敗: {e}"
+
+    await ctx.respond(
+        f"✅ {user.mention} を **{house_emoji} {house_name_jp}** に登録しました。\n"
+        f"tier={tier} / bracket={bracket}\n"
+        f"{role_msg}\n"
+        f"剥奪した他寮ロール: {', '.join(removed) if removed else 'なし'}\n"
+        "次回 D1 同期 (最大5分以内) でダッシュボードに反映されます。",
+        ephemeral=True,
+    )
 
 
 @bot.slash_command(
