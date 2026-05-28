@@ -32,6 +32,24 @@ RANK_ROLES: dict[str, str] = {
     "GRANDMASTER": "LoL Grandmaster(Solo/Duo)", "CHALLENGER": "LoL Challenger(Solo/Duo)"
 }
 
+# VC作成時のチャンネル名候補（Runeterra 地域名）。同カテゴリ内で重複しないようにランダム選択する
+LOL_REGIONS: list[str] = [
+    "デマーシア",
+    "ノクサス",
+    "アイオニア",
+    "ピルトーヴァー",
+    "ゾウン",
+    "フレヨルド",
+    "ビルジウォーター",
+    "シャドウアイル",
+    "シュリーマ",
+    "ターゴン",
+    "バンドルシティ",
+    "イシュタル",
+    "ヴォイド",
+    "カマヴォー",
+]
+
 # --- 組分け帽子機能の設定 ---
 # 組（ハウス）定義: (内部ID, 表示名, 絵文字, ロール名)
 # 命名は LoL Elemental Drake 準拠。内部IDは旧ジャングルキャンプ名のまま（DB migration 不要）
@@ -2630,6 +2648,20 @@ async def on_message(message: discord.Message) -> None:
         await notify_level_up(discord_id, old_level, new_level)
 
 
+def _pick_unused_region(category: discord.CategoryChannel) -> str:
+    """VC作成時のチャンネル名を Runeterra 地域名からランダム選択する。
+
+    同カテゴリ内の既存VCチャンネル名と重複しない地域を選ぶ。
+    全14地域使い切ったときは従来の5文字ランダムをフォールバックとして返す。
+    """
+    in_use: set[str] = {vc.name for vc in category.voice_channels}
+    available: list[str] = [r for r in LOL_REGIONS if r not in in_use]
+    if available:
+        return random.choice(available)
+    # 全地域使い切り時のフォールバック（既存ロジック互換）
+    return "".join(random.choices(string.ascii_letters + string.digits, k=5))
+
+
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
     # --- コントリビューション: VC在室秒数の計測 ---
@@ -2652,7 +2684,10 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         if not category:
             return
         try:
-            channel_name: str = "👀｜ランク戦見守り部屋" if after.channel.id == RANK_GAME_CHANNEL_ID else "".join(random.choices(string.ascii_letters + string.digits, k=5))
+            if after.channel.id == RANK_GAME_CHANNEL_ID:
+                channel_name: str = "👀｜ランク戦見守り部屋"
+            else:
+                channel_name = _pick_unused_region(category)
             new_channel: discord.VoiceChannel = await guild.create_voice_channel(
                 name=channel_name,
                 category=category,
