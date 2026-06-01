@@ -425,6 +425,65 @@ def vc_session_end(discord_id: int) -> tuple[int, int]:
     # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
     added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
     return add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
+
+
+def vc_session_tick(discord_id: int) -> tuple[int, int]:
+    """進行中のVCセッションを退出を待たずに途中確定する。
+
+    前回確定以降に経過した「満分」だけXPを加算し、その分 joined_at を前進させる
+    （端数秒は次回に持ち越すのでロスしない）。定期タスクから呼ぶことで、在室中でも
+    ポイントが随時ダッシュボードへ反映される。再起動で失われる在室時間も、
+    セッション丸ごと → 最大1分（tick間隔）に縮小する。
+
+    返り値: (old_level, new_level) - Lvアップ判定用。加算なしなら (0, 0)。
+    """
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT joined_at FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    if not row:
+        con.close()
+        return (0, 0)
+    try:
+        joined_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+    except ValueError:
+        cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+        con.commit()
+        con.close()
+        return (0, 0)
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    seconds: int = max(0, int((now_utc - joined_at).total_seconds()))
+    full_minutes: int = seconds // 60
+    if full_minutes <= 0:
+        con.close()
+        return (0, 0)
+    credited_seconds: int = full_minutes * 60
+    # 確定済みの分だけ joined_at を前進（端数秒は次回まわし）
+    new_joined_at: datetime.datetime = joined_at + datetime.timedelta(seconds=credited_seconds)
+    cur.execute(
+        "UPDATE vc_sessions SET joined_at = ? WHERE discord_id = ?",
+        (new_joined_at.isoformat(), discord_id),
+    )
+    con.commit()
+    con.close()
+    added_xp: int = full_minutes * CONTRIBUTION_VC_PT_PER_MINUTE
+    return add_contribution(discord_id, xp=added_xp, vc_seconds=credited_seconds, text_messages=0)
+
+
+def currently_active_voice_user_ids() -> set[int]:
+    """いまAFK以外のVCに在室している（Bot以外の）ユーザーIDの集合。
+
+    起動時の照合と、tickタスクでの孤児セッション掃除（退出イベント取りこぼし対策）に使う。
+    """
+    ids: set[int] = set()
+    for guild in bot.guilds:
+        for vc in guild.voice_channels:
+            if vc.id == AFK_CHANNEL_ID:
+                continue
+            for vc_member in vc.members:
+                if not vc_member.bot:
+                    ids.add(vc_member.id)
+    return ids
 # -----------------------------
 
 # --- Botの初期設定 ---
@@ -625,6 +684,16 @@ class SortingHatTierSelect(discord.ui.Select):
                     print(f"!!! sorting_hat: failed to add role '{role_name}': {e}")
             else:
                 print(f"!!! sorting_hat: role '{role_name}' not found in guild")
+
+            # VC在室中に組分けした場合は即セッション開始（ロス防止）
+            # on_voice_state_update は「チャンネル変更時」しか発火しないため、在室したまま
+            # 組分けすると計測が始まらない。ここで明示的に開始する。
+            if (
+                member.voice is not None
+                and member.voice.channel is not None
+                and member.voice.channel.id != AFK_CHANNEL_ID
+            ):
+                vc_session_start(member.id, member.voice.channel.id)
 
         # 本人へのephemeral返答
         await interaction.followup.send(
@@ -959,10 +1028,32 @@ async def on_ready() -> None:
     # Bot起動時に永続Viewを登録
     bot.add_view(DashboardView())
 
-    # --- コントリビューション: 起動時のVC在室者スキャン ---
-    # 再起動を跨いで在室している組分け済みメンバーを vc_sessions に再登録する
-    # （再起動中の時間はロストする。今この瞬間からの計測再開）
+    # --- コントリビューション: 起動時のVC在室セッション照合 ---
+    # vc_sessions は /data に永続化されるため再起動を跨いで残る。これを現在の在室状況と照合する：
+    #   - 在室継続中の既存セッション: 経過分（デプロイのダウンタイム含む）を確定し、計測を継続
+    #     → デプロイで在室ユーザーの時間が消えない
+    #   - ダウンタイム中に退出した既存セッション: 退出時刻が不明なため孤児として破棄
+    #     → tickがXPを加算し続けるリークを防止
+    #   - 在室中でセッション未登録の組分け済みメンバー: 新規セッション開始
     # AFK チャンネルは計測対象外
+    present_ids: set[int] = currently_active_voice_user_ids()
+    con_sc: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur_sc: sqlite3.Cursor = con_sc.cursor()
+    cur_sc.execute("SELECT discord_id FROM vc_sessions")
+    existing_ids: set[int] = {r[0] for r in cur_sc.fetchall()}
+    orphan_ids: list[int] = [sid for sid in existing_ids if sid not in present_ids]
+    for sid in orphan_ids:
+        cur_sc.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (sid,))
+    con_sc.commit()
+    con_sc.close()
+    # 在室継続中の既存セッションは経過分（ダウンタイム含む）を確定して計測継続
+    resumed_ids: set[int] = existing_ids & present_ids
+    for sid in resumed_ids:
+        try:
+            vc_session_tick(sid)
+        except Exception as e:
+            print(f"!!! startup vc_session_tick error for {sid}: {e}")
+    # 在室中でセッション未登録の組分け済みメンバーは新規開始
     for guild in bot.guilds:
         for vc in guild.voice_channels:
             if vc.id == AFK_CHANNEL_ID:
@@ -970,9 +1061,9 @@ async def on_ready() -> None:
             for vc_member in vc.members:
                 if vc_member.bot:
                     continue
-                if is_sorted(vc_member.id):
+                if vc_member.id not in existing_ids and is_sorted(vc_member.id):
                     vc_session_start(vc_member.id, vc.id)
-    print("--- VC sessions re-initialized for sorted members (AFK excluded) ---")
+    print(f"--- VC sessions reconciled: {len(resumed_ids)} resumed, {len(orphan_ids)} orphans purged (AFK excluded) ---")
 
     # 起動時ランキング速報は一旦停止（再開する場合は下記ブロックを有効化）
     # print("--- Posting initial ranking on startup ---")
@@ -990,6 +1081,8 @@ async def on_ready() -> None:
         monthly_summary_task.start()
     if not daily_snapshot_task.is_running():
         daily_snapshot_task.start()
+    if not vc_contribution_tick_task.is_running():
+        vc_contribution_tick_task.start()
     # 起動時、今日のスナップショットが無ければ取る（個人ページのグラフが初回から表示できるように）
     try:
         today_jst: datetime.date = datetime.datetime.now(jst).date()
@@ -2613,6 +2706,29 @@ async def sync_to_d1_task() -> None:
         print(f"--- sync_to_d1 OK: {counts} ---")
     else:
         print(f"!!! sync_to_d1 FAILED: status={result.get('status')} error={result.get('error')}")
+
+
+# 在室中のVCセッションを1分ごとに途中確定し、ポイントを随時反映する
+@tasks.loop(minutes=1)
+async def vc_contribution_tick_task() -> None:
+    present_ids: set[int] = currently_active_voice_user_ids()
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT discord_id FROM vc_sessions")
+    discord_ids: list[int] = [r[0] for r in cur.fetchall()]
+    con.close()
+    for discord_id in discord_ids:
+        try:
+            if discord_id in present_ids:
+                # 在室継続中: 経過した満分を確定
+                old_level, new_level = vc_session_tick(discord_id)
+            else:
+                # 退出イベントを取りこぼした孤児セッション: 確定して掃除（XPリーク防止）
+                old_level, new_level = vc_session_end(discord_id)
+            if new_level > old_level:
+                await notify_level_up(discord_id, old_level, new_level)
+        except Exception as e:
+            print(f"!!! vc_contribution_tick_task error for {discord_id}: {e}")
 
 
 @bot.event
