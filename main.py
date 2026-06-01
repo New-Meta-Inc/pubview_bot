@@ -685,6 +685,16 @@ class SortingHatTierSelect(discord.ui.Select):
             else:
                 print(f"!!! sorting_hat: role '{role_name}' not found in guild")
 
+            # VC在室中に組分けした場合は即セッション開始（ロス防止）
+            # on_voice_state_update は「チャンネル変更時」しか発火しないため、在室したまま
+            # 組分けすると計測が始まらない。ここで明示的に開始する。
+            if (
+                member.voice is not None
+                and member.voice.channel is not None
+                and member.voice.channel.id != AFK_CHANNEL_ID
+            ):
+                vc_session_start(member.id, member.voice.channel.id)
+
         # 本人へのephemeral返答
         await interaction.followup.send(
             f"🎩 帽子はあなたを **{house_emoji} {house_name_jp}** に振り分けました！",
