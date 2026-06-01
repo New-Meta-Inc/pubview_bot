@@ -425,6 +425,49 @@ def vc_session_end(discord_id: int) -> tuple[int, int]:
     # 分単位で切り捨て、端数秒は次回まわし（vc_secondsは秒で記録）
     added_xp: int = (seconds // 60) * CONTRIBUTION_VC_PT_PER_MINUTE
     return add_contribution(discord_id, xp=added_xp, vc_seconds=seconds, text_messages=0)
+
+
+def vc_session_tick(discord_id: int) -> tuple[int, int]:
+    """進行中のVCセッションを退出を待たずに途中確定する。
+
+    前回確定以降に経過した「満分」だけXPを加算し、その分 joined_at を前進させる
+    （端数秒は次回に持ち越すのでロスしない）。定期タスクから呼ぶことで、在室中でも
+    ポイントが随時ダッシュボードへ反映される。再起動で失われる在室時間も、
+    セッション丸ごと → 最大1分（tick間隔）に縮小する。
+
+    返り値: (old_level, new_level) - Lvアップ判定用。加算なしなら (0, 0)。
+    """
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT joined_at FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+    row: tuple[str] | None = cur.fetchone()
+    if not row:
+        con.close()
+        return (0, 0)
+    try:
+        joined_at: datetime.datetime = datetime.datetime.fromisoformat(row[0])
+    except ValueError:
+        cur.execute("DELETE FROM vc_sessions WHERE discord_id = ?", (discord_id,))
+        con.commit()
+        con.close()
+        return (0, 0)
+    now_utc: datetime.datetime = datetime.datetime.now(datetime.timezone.utc)
+    seconds: int = max(0, int((now_utc - joined_at).total_seconds()))
+    full_minutes: int = seconds // 60
+    if full_minutes <= 0:
+        con.close()
+        return (0, 0)
+    credited_seconds: int = full_minutes * 60
+    # 確定済みの分だけ joined_at を前進（端数秒は次回まわし）
+    new_joined_at: datetime.datetime = joined_at + datetime.timedelta(seconds=credited_seconds)
+    cur.execute(
+        "UPDATE vc_sessions SET joined_at = ? WHERE discord_id = ?",
+        (new_joined_at.isoformat(), discord_id),
+    )
+    con.commit()
+    con.close()
+    added_xp: int = full_minutes * CONTRIBUTION_VC_PT_PER_MINUTE
+    return add_contribution(discord_id, xp=added_xp, vc_seconds=credited_seconds, text_messages=0)
 # -----------------------------
 
 # --- Botの初期設定 ---
@@ -990,6 +1033,8 @@ async def on_ready() -> None:
         monthly_summary_task.start()
     if not daily_snapshot_task.is_running():
         daily_snapshot_task.start()
+    if not vc_contribution_tick_task.is_running():
+        vc_contribution_tick_task.start()
     # 起動時、今日のスナップショットが無ければ取る（個人ページのグラフが初回から表示できるように）
     try:
         today_jst: datetime.date = datetime.datetime.now(jst).date()
@@ -2613,6 +2658,23 @@ async def sync_to_d1_task() -> None:
         print(f"--- sync_to_d1 OK: {counts} ---")
     else:
         print(f"!!! sync_to_d1 FAILED: status={result.get('status')} error={result.get('error')}")
+
+
+# 在室中のVCセッションを1分ごとに途中確定し、ポイントを随時反映する
+@tasks.loop(minutes=1)
+async def vc_contribution_tick_task() -> None:
+    con: sqlite3.Connection = sqlite3.connect(DB_PATH)
+    cur: sqlite3.Cursor = con.cursor()
+    cur.execute("SELECT discord_id FROM vc_sessions")
+    discord_ids: list[int] = [r[0] for r in cur.fetchall()]
+    con.close()
+    for discord_id in discord_ids:
+        try:
+            old_level, new_level = vc_session_tick(discord_id)
+            if new_level > old_level:
+                await notify_level_up(discord_id, old_level, new_level)
+        except Exception as e:
+            print(f"!!! vc_contribution_tick_task error for {discord_id}: {e}")
 
 
 @bot.event
