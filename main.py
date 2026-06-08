@@ -2113,23 +2113,36 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
 
     con: sqlite3.Connection = sqlite3.connect(DB_PATH)
     cur: sqlite3.Cursor = con.cursor()
-    # 寮メンバー + 現在の累積 + 先週のスナップショット
+    # 寮メンバー + 現在の累積 + 先週のベースライン
+    # ベースライン優先順位:
+    #   1) weekly_snapshots[last_monday]（理想）
+    #   2) 先週月曜以降に存在する daily_snapshots の最古エントリ（途中加入ユーザー向け fallback）
+    #   3) 0（真の初登場 — has_prev = False で +0 pt 表示）
     cur.execute(
         """
         SELECT s.discord_id,
                COALESCE(t.total_xp,     0) AS total_xp,
                COALESCE(t.vc_seconds,   0) AS vc_seconds,
                COALESCE(t.text_messages,0) AS text_messages,
-               COALESCE(ws.total_xp,    0) AS prev_xp,
-               COALESCE(ws.vc_seconds,  0) AS prev_vc,
-               COALESCE(ws.text_messages,0) AS prev_text,
-               (ws.discord_id IS NOT NULL) AS has_prev
+               COALESCE(ws.total_xp,    ds.total_xp,      0) AS prev_xp,
+               COALESCE(ws.vc_seconds,  ds.vc_seconds,    0) AS prev_vc,
+               COALESCE(ws.text_messages, ds.text_messages, 0) AS prev_text,
+               (ws.discord_id IS NOT NULL OR ds.discord_id IS NOT NULL) AS has_prev
         FROM sorting_hat s
         LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
         LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+        LEFT JOIN (
+            SELECT ds1.discord_id, ds1.total_xp, ds1.vc_seconds, ds1.text_messages
+            FROM daily_snapshots ds1
+            WHERE ds1.snapshot_date = (
+                SELECT MIN(ds2.snapshot_date) FROM daily_snapshots ds2
+                WHERE ds2.discord_id = ds1.discord_id
+                  AND ds2.snapshot_date >= ?
+            )
+        ) ds ON s.discord_id = ds.discord_id
         WHERE s.house_id = ?
         """,
-        (last_monday.isoformat(), house_id),
+        (last_monday.isoformat(), last_monday.isoformat(), house_id),
     )
     rows: list[tuple[int, int, int, int, int, int, int, int]] = cur.fetchall()
     con.close()
@@ -2156,7 +2169,8 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
             "level": level_from_xp(total_xp),
         })
 
-    members.sort(key=lambda m: m["gained_xp"], reverse=True)
+    # 先週獲得 pt の降順。同点の場合は累積XP降順（ベテラン優先）で安定化
+    members.sort(key=lambda m: (m["gained_xp"], m["total_xp"]), reverse=True)
 
     house_gained: int = sum(m["gained_xp"] for m in members)
     active_count: int = sum(1 for m in members if m["gained_xp"] > 0)
@@ -2187,20 +2201,32 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
             f"{bar} **+{m['gained_xp']:,} pt** ({share:.1f}%)"
         )
 
-    # 寮間順位算出
+    # 寮間順位算出（baseline は上の単体寮クエリと同じく weekly→daily の fallback）
     standings: list[tuple[str, int]] = []
     con2: sqlite3.Connection = sqlite3.connect(DB_PATH)
     cur2: sqlite3.Cursor = con2.cursor()
     for h in HOUSES:
         cur2.execute(
             """
-            SELECT COALESCE(SUM(t.total_xp - COALESCE(ws.total_xp, 0)), 0)
+            SELECT COALESCE(
+                     SUM(COALESCE(t.total_xp, 0) - COALESCE(ws.total_xp, ds.total_xp, 0)),
+                     0
+                   )
             FROM sorting_hat s
             LEFT JOIN contribution_totals t ON s.discord_id = t.discord_id
             LEFT JOIN weekly_snapshots   ws ON s.discord_id = ws.discord_id AND ws.snapshot_date = ?
+            LEFT JOIN (
+                SELECT ds1.discord_id, ds1.total_xp
+                FROM daily_snapshots ds1
+                WHERE ds1.snapshot_date = (
+                    SELECT MIN(ds2.snapshot_date) FROM daily_snapshots ds2
+                    WHERE ds2.discord_id = ds1.discord_id
+                      AND ds2.snapshot_date >= ?
+                )
+            ) ds ON s.discord_id = ds.discord_id
             WHERE s.house_id = ?
             """,
-            (last_monday.isoformat(), h[0]),
+            (last_monday.isoformat(), last_monday.isoformat(), h[0]),
         )
         result: tuple[int] = cur2.fetchone()
         standings.append((h[0], result[0]))
