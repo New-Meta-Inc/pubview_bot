@@ -2109,7 +2109,7 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
     now_jst: datetime.datetime = datetime.datetime.now(jst)
     this_monday: datetime.date = _this_jst_monday(now_jst)
     last_monday: datetime.date = this_monday - datetime.timedelta(days=7)
-    this_sunday: datetime.date = this_monday + datetime.timedelta(days=6)
+    last_sunday: datetime.date = last_monday + datetime.timedelta(days=6)
 
     con: sqlite3.Connection = sqlite3.connect(DB_PATH)
     cur: sqlite3.Cursor = con.cursor()
@@ -2136,7 +2136,7 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
 
     if not rows:
         try:
-            await channel.send(f"今週のダイジェスト: {house_emoji} {house_name_jp} はまだメンバーがいません。")
+            await channel.send(f"先週のダイジェスト: {house_emoji} {house_name_jp} はまだメンバーがいません。")
         except Exception as e:
             return f"send failed: {e}"
         return f"{house_id}: no members"
@@ -2166,7 +2166,7 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
 
     # KPIs
     kpi_lines: list[str] = [
-        f"├ 今週の獲得pt: **+{house_gained:,} pt**",
+        f"├ 先週の獲得pt: **+{house_gained:,} pt**",
         f"├ 参加メンバー: **{active_count}/{member_count}** ({(active_count/max(1,member_count)*100):.1f}%)",
         f"├ VC在室時間: **{total_vc//3600}h {(total_vc%3600)//60}m**",
         f"└ テキスト投稿: **{total_text:,}件**",
@@ -2221,7 +2221,7 @@ async def post_weekly_digest_for_house(house_id: str) -> str:
         title=f"{house_emoji} {house_name_jp} 週次ダイジェスト",
         url=house_page_url,
         description=(
-            f"📅 {this_monday.strftime('%Y年%m月%d日')} 〜 {this_sunday.strftime('%Y年%m月%d日')}\n\n"
+            f"📅 {last_monday.strftime('%Y年%m月%d日')} 〜 {last_sunday.strftime('%Y年%m月%d日')}\n\n"
             f"📊 主要指標 (KPIs)\n{desc}"
         ),
         color=discord.Color.dark_purple(),
