@@ -126,6 +126,19 @@ function userLevelInfo(xp: number) {
       </p>
     </header>
 
+    <!-- ナビゲーション -->
+    <nav class="mt-6 flex flex-wrap gap-2 text-sm">
+      <a href="/leaderboard" class="inline-flex items-center gap-1.5 rounded-full bg-slate-900/70 px-3 py-1.5 ring-1 ring-slate-800 transition hover:bg-slate-800 hover:ring-slate-700">
+        <span>🏆</span><span>全体ランキング</span>
+      </a>
+      <a href={`/monthly/${currentYm}`} class="inline-flex items-center gap-1.5 rounded-full bg-slate-900/70 px-3 py-1.5 ring-1 ring-slate-800 transition hover:bg-slate-800 hover:ring-slate-700">
+        <span>📅</span><span>月次アーカイブ</span>
+      </a>
+      <a href="/levels" class="inline-flex items-center gap-1.5 rounded-full bg-emerald-900/30 px-3 py-1.5 font-medium ring-1 ring-emerald-700/50 text-emerald-200 transition hover:bg-emerald-900/50 hover:ring-emerald-500">
+        <span>📈</span><span>経験値テーブル</span>
+      </a>
+    </nav>
+
     <!-- 4寮カード -->
     <section class="mt-10 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
       {HOUSES.map((h) => {
